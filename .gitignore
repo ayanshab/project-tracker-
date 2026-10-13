@@ -256,3 +256,6 @@ tfplan
 
 # Snyk Security Extension - AI Rules (auto-generated)
 .github/instructions/snyk_rules.instructions.md
+backend/*/psycopg*/
+backend/*/.pip_installed
+__pycache__/

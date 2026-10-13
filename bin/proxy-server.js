@@ -101,6 +101,7 @@ const server = http.createServer((req, res) => {
       'accept': headers.accept || 'application/json',
       'content-type': headers['content-type'] || 'application/json',
       'user-agent': headers['user-agent'] || 'proxy-server',
+       ...(headers.authorization ? { 'authorization': headers.authorization } : {}),
       'host': target.host
     }
   };
