@@ -259,3 +259,8 @@ tfplan
 backend/*/psycopg*/
 backend/*/.pip_installed
 __pycache__/
+ENVIRONMENT.config
+frontend/.env
+infra/builds/
+infra/.terraform/
+*.tfstate*
