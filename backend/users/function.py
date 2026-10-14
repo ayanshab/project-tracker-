@@ -11,6 +11,8 @@ Routes (all under /api/users, all require Authorization: Bearer <token>):
     POST   /{id}/archive         -> admin: archive a user
     POST   /{id}/unarchive       -> admin: restore a user
     POST   /{id}/reset-password  -> admin: issue a new temp password
+    GET    /audit                -> admin: audit log; query: q, action, entity_type, entity_id,
+                                    actor_id, from, to (YYYY-MM-DD), limit, offset
 
 Visibility:
     admin    -> everyone
@@ -31,6 +33,8 @@ import re
 from common import (
     PUBLIC_USER_COLUMNS,
     ApiError,
+    audit,
+    changes,
     error,
     generate_password,
     generate_username,
@@ -220,12 +224,15 @@ def create_user(viewer, body):
 
     row = execute(
         f"""
-        INSERT INTO users (username, password_hash, name, email, job_title, role, manager_id, pay_rate)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        INSERT INTO users (username, password_hash, name, email, job_title, role, manager_id, pay_rate,
+                           must_change_password)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, TRUE)
         RETURNING {PUBLIC_USER_COLUMNS}
         """,
         (username, hash_password(temp_password), name, email, job_title, role, manager_id, pay_rate),
     )
+    audit(viewer, "user.create", "user", row["id"], name,
+          {"role": role, "email": email, "job_title": job_title, "manager_id": manager_id, "pay_rate": pay_rate})
     return response(201, {
         "user": row,
         "temporary_password": temp_password,
@@ -295,6 +302,10 @@ def update_user(viewer, user_id, body):
         f"UPDATE users SET {', '.join(sets)} WHERE id = %s RETURNING {PUBLIC_USER_COLUMNS}",
         args,
     )
+    diff = changes(target, row, requested)
+    if diff:
+        action = "user.reassign_manager" if "manager_id" in diff else "user.update"
+        audit(viewer, action, "user", user_id, row["name"], {"changes": diff})
     return response(200, {"user": _shape(row, viewer)})
 
 
@@ -315,6 +326,7 @@ def set_archived(viewer, user_id, archived):
         f"UPDATE users SET is_archived = %s, updated_at = now() WHERE id = %s RETURNING {PUBLIC_USER_COLUMNS}",
         (archived, user_id),
     )
+    audit(viewer, "user.archive" if archived else "user.unarchive", "user", user_id, row["name"])
     return response(200, {"user": row})
 
 
@@ -325,10 +337,51 @@ def reset_password(viewer, user_id):
         raise ApiError(404, "User not found")
     temp_password = generate_password()
     execute(
-        "UPDATE users SET password_hash = %s, updated_at = now() WHERE id = %s",
+        "UPDATE users SET password_hash = %s, must_change_password = TRUE, updated_at = now() WHERE id = %s",
         (hash_password(temp_password), user_id),
     )
+    target = _get_user(user_id)
+    audit(viewer, "user.reset_password", "user", user_id, target["name"])
     return response(200, {"temporary_password": temp_password})
+
+
+# ---------- Audit log (admin only) ----------
+
+def audit_log(viewer, params):
+    require_role(viewer, "admin")
+    where, args = [], []
+    if params.get("actor_id"):
+        where.append("actor_id = %s"); args.append(_check_uuid(params["actor_id"], "actor_id"))
+    if params.get("action"):
+        where.append("action LIKE %s"); args.append(params["action"].strip() + "%")
+    if params.get("entity_type"):
+        where.append("entity_type = %s"); args.append(params["entity_type"].strip())
+    if params.get("entity_id"):
+        where.append("entity_id = %s"); args.append(params["entity_id"].strip())
+    if params.get("q"):
+        term = f"%{params['q'].strip()}%"
+        where.append("(actor_name ILIKE %s OR entity_name ILIKE %s OR action ILIKE %s OR details::text ILIKE %s)")
+        args += [term] * 4
+    for key, op in (("from", ">="), ("to", "<")):
+        if params.get(key):
+            where.append(f"occurred_at {op} %s::date" + (" + 1" if key == "to" else ""))
+            args.append(params[key])
+    try:
+        limit = max(1, min(int(params.get("limit", 100)), 500))
+        offset = max(0, int(params.get("offset", 0)))
+    except ValueError:
+        raise ApiError(400, "limit and offset must be numbers")
+    clause = f"WHERE {' AND '.join(where)}" if where else ""
+    rows = query(
+        f"SELECT * FROM audit_log {clause} ORDER BY occurred_at DESC, id DESC LIMIT %s OFFSET %s",
+        args + [limit + 1, offset],
+    )
+    actions = query("SELECT DISTINCT action FROM audit_log ORDER BY action")
+    return response(200, {
+        "entries": rows[:limit],
+        "has_more": len(rows) > limit,
+        "actions": [a["action"] for a in actions],
+    })
 
 
 # ---------- Router ----------
@@ -350,6 +403,8 @@ def handler(event=None, context=None):
             if method == "POST":
                 return create_user(viewer, body)
         elif len(parts) == 1:
+            if parts[0] == "audit" and method == "GET":
+                return audit_log(viewer, params)
             if parts[0] == "me" and method == "GET":
                 return response(200, {"user": viewer})
             if method == "GET":

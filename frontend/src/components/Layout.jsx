@@ -12,6 +12,7 @@ const NAV = {
     ['/allocation', 'Allocation'],
     ['/budgets', 'Budgets'],
     ['/archive', 'Archive'],
+    ['/audit', 'Audit log'],
   ],
   manager: [
     ['/', 'Overview'],

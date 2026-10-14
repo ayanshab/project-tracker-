@@ -32,7 +32,7 @@ import logging
 import re
 from datetime import date
 
-from common import ApiError, error, get_current_user, parse_event, require_fields, response
+from common import ApiError, audit, changes, error, get_current_user, parse_event, require_fields, response
 from db import ensure_schema, execute, query, query_one
 
 logger = logging.getLogger()
@@ -242,6 +242,8 @@ def create_milestone(viewer, body):
             start, end,
         ),
     )
+    audit(viewer, "milestone.create", "milestone", row["id"], body["name"].strip(),
+          {"project_id": project["id"], "project_name": project["name"], "start_date": start, "end_date": end})
     return response(201, {"milestone": _detail(viewer, row["id"])})
 
 
@@ -266,6 +268,11 @@ def update_milestone(viewer, ms_id, body):
         raise ApiError(400, "No editable fields provided")
     sets.append("updated_at = now()")
     execute(f"UPDATE milestones SET {', '.join(sets)} WHERE id = %s", args + [ms["id"]])
+    after = query_one("SELECT * FROM milestones WHERE id = %s", (ms["id"],))
+    diff = changes(ms, after, ("name", "description", "start_date", "end_date"))
+    if diff:
+        audit(viewer, "milestone.update", "milestone", ms["id"], after["name"],
+              {"project_name": project["name"], "changes": diff})
     return response(200, {"milestone": _detail(viewer, ms["id"])})
 
 
@@ -278,6 +285,7 @@ def delete_milestone(viewer, ms_id):
     execute("DELETE FROM tasks WHERE milestone_id = %s", (ms["id"],))
     execute("DELETE FROM milestone_members WHERE milestone_id = %s", (ms["id"],))
     execute("DELETE FROM milestones WHERE id = %s", (ms["id"],))
+    audit(viewer, "milestone.delete", "milestone", ms["id"], ms["name"], {"project_id": ms["project_id"], "position": ms["position"]})
     # Close the gap in numbering (two steps to avoid clashing with the unique constraint).
     execute("UPDATE milestones SET position = position + 100000 WHERE project_id = %s AND position > %s",
             (ms["project_id"], ms["position"]))
@@ -294,6 +302,7 @@ def start_milestone(viewer, ms_id):
     if prev and prev["status"] != "completed":
         raise ApiError(409, f"Finish milestone #{prev['position']} '{prev['name']}' before starting this one")
     execute("UPDATE milestones SET status = 'in_progress', updated_at = now() WHERE id = %s", (ms["id"],))
+    audit(viewer, "milestone.start", "milestone", ms["id"], ms["name"], {"project_id": ms["project_id"]})
     return response(200, {"milestone": _detail(viewer, ms["id"])})
 
 
@@ -316,6 +325,8 @@ def complete_milestone(viewer, ms_id, body):
         "UPDATE milestones SET status = 'completed', completed_at = now(), updated_at = now() WHERE id = %s",
         (ms["id"],),
     )
+    audit(viewer, "milestone.complete", "milestone", ms["id"], ms["name"],
+          {"project_id": ms["project_id"], "forced": bool(open_tasks), "open_tasks": open_tasks})
     return response(200, {"milestone": _detail(viewer, ms["id"])})
 
 
@@ -330,6 +341,7 @@ def reopen_milestone(viewer, ms_id):
         "UPDATE milestones SET status = 'in_progress', completed_at = NULL, updated_at = now() WHERE id = %s",
         (ms["id"],),
     )
+    audit(viewer, "milestone.reopen", "milestone", ms["id"], ms["name"], {"project_id": ms["project_id"]})
     return response(200, {"milestone": _detail(viewer, ms["id"])})
 
 
@@ -364,6 +376,8 @@ def add_member(viewer, ms_id, body):
     if query_one("SELECT 1 FROM milestone_members WHERE milestone_id = %s AND user_id = %s", (ms["id"], user_id)):
         raise ApiError(409, "That person is already on this milestone")
     execute("INSERT INTO milestone_members (milestone_id, user_id) VALUES (%s, %s)", (ms["id"], user_id))
+    audit(viewer, "milestone.member_add", "milestone", ms["id"], ms["name"],
+          {"user_id": user_id, "user_name": on_project["name"]})
     return response(201, {"milestone": _detail(viewer, ms["id"])})
 
 
@@ -372,6 +386,7 @@ def remove_member(viewer, ms_id, user_id):
     user_id = _uuid(user_id, "user_id")
     if not execute("DELETE FROM milestone_members WHERE milestone_id = %s AND user_id = %s", (ms["id"], user_id)):
         raise ApiError(404, "That person is not on this milestone")
+    audit(viewer, "milestone.member_remove", "milestone", ms["id"], ms["name"], {"user_id": user_id})
     execute("UPDATE tasks SET assigned_to = NULL WHERE milestone_id = %s AND assigned_to = %s AND completed = FALSE",
             (ms["id"], user_id))
     return response(200, {"milestone": _detail(viewer, ms["id"])})
@@ -401,6 +416,7 @@ def add_task(viewer, ms_id, body):
             _check_assignee(ms["id"], body.get("assigned_to")),
         ),
     )
+    audit(viewer, "task.create", "milestone", ms["id"], ms["name"], {"title": body["title"].strip()})
     return response(201, {"milestone": _detail(viewer, ms["id"])})
 
 
@@ -440,6 +456,14 @@ def update_task(viewer, task_id, body):
         raise ApiError(400, "No editable fields provided")
     sets.append("updated_at = now()")
     execute(f"UPDATE tasks SET {', '.join(sets)} WHERE id = %s", args + [task["id"]])
+    if "completed" in body:
+        audit(viewer, "task.complete" if body["completed"] else "task.reopen", "task", task["id"], task["title"],
+              {"milestone_id": ms["id"], "milestone_name": ms["name"]})
+    if manager_fields:
+        after = query_one("SELECT * FROM tasks WHERE id = %s", (task["id"],))
+        diff = changes(task, after, ("title", "description", "assigned_to"))
+        if diff:
+            audit(viewer, "task.update", "task", task["id"], after["title"], {"changes": diff})
     return response(200, {"milestone": _detail(viewer, ms["id"])})
 
 
@@ -449,6 +473,7 @@ def delete_task(viewer, task_id):
         raise ApiError(404, "Task not found")
     ms, _, _ = _milestone(viewer, task["milestone_id"], manage=True)
     execute("DELETE FROM tasks WHERE id = %s", (task["id"],))
+    audit(viewer, "task.delete", "task", task["id"], task["title"], {"milestone_id": ms["id"], "milestone_name": ms["name"]})
     return response(200, {"milestone": _detail(viewer, ms["id"])})
 
 

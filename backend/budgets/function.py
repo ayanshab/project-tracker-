@@ -24,7 +24,7 @@ import logging
 import re
 from datetime import date, timedelta
 
-from common import ApiError, error, get_current_user, parse_event, require_fields, require_role, response
+from common import ApiError, audit, error, get_current_user, parse_event, require_fields, require_role, response
 from db import ensure_schema, execute, query, query_one
 
 logger = logging.getLogger()
@@ -144,6 +144,8 @@ def log_time(viewer, body):
         "VALUES (%s, %s, %s, %s, %s, %s) RETURNING *",
         (viewer["id"], project["id"], milestone_id, work_date, hours, (body.get("note") or "").strip()[:500] or None),
     )
+    audit(viewer, "time.log", "project", project["id"], project["name"],
+          {"entry_id": row["id"], "work_date": work_date, "hours": hours, "milestone_id": milestone_id})
     return response(201, {"entry": row, "day_total": day_total + hours, "week_total": week_total + hours})
 
 
@@ -225,6 +227,8 @@ def delete_time(viewer, entry_id):
     if viewer["role"] != "admin" and str(entry["user_id"]) != str(viewer["id"]):
         raise ApiError(403, "You can only delete your own time entries")
     execute("DELETE FROM time_entries WHERE id = %s", (entry["id"],))
+    audit(viewer, "time.delete", "project", entry["project_id"], None,
+          {"entry_id": entry["id"], "owner_id": entry["user_id"], "work_date": entry["work_date"], "hours": entry["hours"]})
     return response(200, {"message": "Time entry deleted"})
 
 
@@ -257,6 +261,8 @@ def add_cost(viewer, body):
             _date(body["incurred_on"], "incurred_on") if body.get("incurred_on") else date.today(),
         ),
     )
+    audit(viewer, "cost.add", "project", project["id"], project["name"],
+          {"cost_id": row["id"], "category": row["category"], "amount": row["amount"], "description": row["description"]})
     return response(201, {"cost": row})
 
 
@@ -266,6 +272,8 @@ def delete_cost(viewer, cost_id):
         raise ApiError(404, "Cost not found")
     _project(viewer, cost["project_id"], manage=True)
     execute("DELETE FROM project_costs WHERE id = %s", (cost["id"],))
+    audit(viewer, "cost.delete", "project", cost["project_id"], None,
+          {"cost_id": cost["id"], "category": cost["category"], "amount": cost["amount"]})
     return response(200, {"message": "Cost deleted"})
 
 

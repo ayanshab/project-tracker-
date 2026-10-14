@@ -68,7 +68,7 @@ function AdminPeople() {
                       </div>
                     </td>
                     <td className="num">{u.employee_number}<div className="muted small">{u.username}</div></td>
-                    <td><Tag tone={ROLE_TONE[u.role]}>{ROLE_LABEL[u.role]}</Tag>{u.is_archived && <Tag>Archived</Tag>}</td>
+                    <td><Tag tone={ROLE_TONE[u.role]}>{ROLE_LABEL[u.role]}</Tag>{u.is_archived && <Tag>Archived</Tag>}{!u.is_archived && u.must_change_password && <Tag tone="warn" title="Has not replaced the temporary password yet">Awaiting first sign-in</Tag>}</td>
                     <td>{u.manager_name || <span className="muted">None</span>}</td>
                     <td className="r num">{fmtMoney(u.pay_rate)}/h</td>
                     <td className="r nowrap">
@@ -147,7 +147,7 @@ function CredentialsModal({ name, username, password, onClose }) {
         <dt>Username</dt><dd className="num">{username}</dd>
         <dt>Temporary password</dt><dd className="num">{password}</dd>
       </dl>
-      <p className="muted small">They can change the password after signing in, from their profile.</p>
+      <p className="muted small">They will be asked to choose their own password the first time they sign in.</p>
     </Modal>
   )
 }

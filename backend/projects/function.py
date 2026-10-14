@@ -30,6 +30,8 @@ from datetime import date
 
 from common import (
     ApiError,
+    audit,
+    changes,
     error,
     get_current_user,
     parse_event,
@@ -119,6 +121,11 @@ def _load_for(viewer, project_id, manage=False):
     if manage and not _can_manage(viewer, project):
         raise ApiError(403, "Only an admin or this project's manager can do that")
     return project
+
+
+def _name(user_id):
+    row = query_one("SELECT name FROM users WHERE id = %s", (user_id,))
+    return row["name"] if row else None
 
 
 def _validate_project_manager(manager_id):
@@ -329,6 +336,17 @@ def get_project(viewer, project_id):
     if viewer["role"] == "employee":
         for key in ("labor_cost", "other_cost", "total_cost", "planned_budget", "budget_used_pct"):
             detail.pop(key, None)
+        # Employees only get full details for their immediate team (same manager) and their manager.
+        # Colleagues from other teams on the same project are shown by name and title only.
+        team = {str(r["id"]) for r in query(
+            "SELECT id FROM users WHERE id = %s OR id = %s OR (manager_id IS NOT NULL AND manager_id = %s)",
+            (viewer["id"], viewer["manager_id"], viewer["manager_id"]),
+        )}
+        for m in members:
+            if str(m["user_id"]) not in team:
+                m.pop("email", None)
+                m.pop("hours_logged", None)
+                m["other_team"] = True
     return response(200, {"project": detail})
 
 
@@ -359,6 +377,9 @@ def create_project(viewer, body):
             _number(body.get("planned_budget", 0), "planned_budget"),
         ),
     )
+    audit(viewer, "project.create", "project", row["id"], name, {
+        "manager_id": manager_id, "start_date": start, "end_date": end,
+        "budget_hours": body.get("budget_hours", 0), "planned_budget": body.get("planned_budget", 0)})
     return get_project(viewer, row["id"]) | {"statusCode": 201}
 
 
@@ -400,6 +421,12 @@ def update_project(viewer, project_id, body):
         raise ApiError(400, "No editable fields provided")
     sets.append("updated_at = now()")
     execute(f"UPDATE projects SET {', '.join(sets)} WHERE id = %s", args + [project["id"]])
+    after = _project(project["id"])
+    diff = changes(project, after, ("name", "description", "start_date", "end_date",
+                                    "budget_hours", "planned_budget", "manager_id"))
+    if diff:
+        action = "project.reassign_manager" if "manager_id" in diff else "project.update"
+        audit(viewer, action, "project", project["id"], after["name"], {"changes": diff})
     return get_project(viewer, project["id"])
 
 
@@ -418,6 +445,7 @@ def complete_project(viewer, project_id):
         "updated_at = now() WHERE id = %s",
         (project["id"],),
     )
+    audit(viewer, "project.complete", "project", project["id"], project["name"], {"auto_archived": True})
     return response(200, {"message": "Project completed and moved to the archive", "id": project["id"]})
 
 
@@ -428,6 +456,7 @@ def set_archived(viewer, project_id, archived):
         raise ApiError(404, "Project not found")
     execute("UPDATE projects SET is_archived = %s, updated_at = now() WHERE id = %s",
             (archived, project["id"]))
+    audit(viewer, "project.archive" if archived else "project.unarchive", "project", project["id"], project["name"])
     return response(200, {"id": project["id"], "is_archived": archived})
 
 
@@ -470,6 +499,9 @@ def add_member(viewer, project_id, body):
         "VALUES (%s, %s, %s, %s, %s)",
         (project["id"], user_id, hours, start, end),
     )
+    audit(viewer, "project.member_add", "project", project["id"], project["name"],
+          {"user_id": user_id, "user_name": _name(user_id), "hours_per_week": hours,
+           "assigned_from": start, "assigned_to": end})
     return get_project(viewer, project["id"]) | {"statusCode": 201}
 
 
@@ -490,6 +522,11 @@ def update_member(viewer, project_id, user_id, body):
         "WHERE project_id = %s AND user_id = %s",
         (hours, start, end, project["id"], user_id),
     )
+    diff = changes(current, {"hours_per_week": hours, "assigned_from": start, "assigned_to": end},
+                   ("hours_per_week", "assigned_from", "assigned_to"))
+    if diff:
+        audit(viewer, "project.member_update", "project", project["id"], project["name"],
+              {"user_id": user_id, "user_name": _name(user_id), "changes": diff})
     return get_project(viewer, project["id"])
 
 
@@ -506,6 +543,8 @@ def remove_member(viewer, project_id, user_id):
     )
     if not removed:
         raise ApiError(404, "That person is not on this project")
+    audit(viewer, "project.member_remove", "project", project["id"], project["name"],
+          {"user_id": user_id, "user_name": _name(user_id)})
     return get_project(viewer, project["id"])
 
 

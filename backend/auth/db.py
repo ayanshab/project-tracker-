@@ -89,9 +89,12 @@ CREATE TABLE IF NOT EXISTS users (
     manager_id       UUID REFERENCES users(id),
     pay_rate         NUMERIC(10, 2) NOT NULL DEFAULT 0 CHECK (pay_rate >= 0),
     is_archived      BOOLEAN NOT NULL DEFAULT FALSE,
+    must_change_password BOOLEAN NOT NULL DEFAULT FALSE,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- Added after the first release: upgrade existing databases in place.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT FALSE;
 CREATE INDEX IF NOT EXISTS users_manager_idx ON users(manager_id);
 
 CREATE TABLE IF NOT EXISTS projects (
@@ -172,6 +175,38 @@ CREATE TABLE IF NOT EXISTS time_entries (
 );
 CREATE INDEX IF NOT EXISTS time_entries_project_idx ON time_entries(project_id);
 CREATE INDEX IF NOT EXISTS time_entries_user_date_idx ON time_entries(user_id, work_date);
+
+CREATE TABLE IF NOT EXISTS audit_log (
+    id               BIGSERIAL PRIMARY KEY,
+    occurred_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    actor_id         UUID,
+    actor_name       TEXT,
+    actor_role       TEXT,
+    action           TEXT NOT NULL,
+    entity_type      TEXT NOT NULL,
+    entity_id        TEXT,
+    entity_name      TEXT,
+    details          JSONB NOT NULL DEFAULT '{}'::jsonb,
+    source_ip        TEXT,
+    user_agent       TEXT
+);
+CREATE INDEX IF NOT EXISTS audit_log_time_idx ON audit_log(occurred_at DESC);
+CREATE INDEX IF NOT EXISTS audit_log_actor_idx ON audit_log(actor_id, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS audit_log_entity_idx ON audit_log(entity_type, entity_id);
+
+-- The audit log is append-only: block edits and deletes at the database level.
+CREATE OR REPLACE FUNCTION audit_log_block_changes() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'audit_log is append-only';
+END;
+$$ LANGUAGE plpgsql;
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'audit_log_append_only') THEN
+        CREATE TRIGGER audit_log_append_only BEFORE UPDATE OR DELETE ON audit_log
+        FOR EACH ROW EXECUTE FUNCTION audit_log_block_changes();
+    END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS project_costs (
     id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),

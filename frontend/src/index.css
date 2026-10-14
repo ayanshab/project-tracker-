@@ -318,6 +318,10 @@ input:disabled, select:disabled { background: var(--paper); color: var(--muted);
 .creds dt { color: var(--muted); font-size: var(--fs-sm); }
 .creds dd { margin: 0; font-weight: 700; font-size: 1.05rem; user-select: all; }
 
+/* ---------- Audit log ---------- */
+.audit td { font-size: var(--fs-sm); }
+.audit-detail { max-width: 46ch; color: var(--ink-2); overflow-wrap: anywhere; }
+
 /* ---------- Tabs ---------- */
 .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--rule); }
 .tab { background: none; border: 0; border-bottom: 2px solid transparent; padding: 8px 14px; font: inherit; font-weight: 600; color: var(--ink-2); cursor: pointer; margin-bottom: -1px; }
@@ -353,6 +357,8 @@ input:disabled, select:disabled { background: var(--paper); color: var(--muted);
 .art-stop { fill: var(--ink); stroke: #3a4658; stroke-width: 5; }
 .art-stop.done { fill: #6f8ff0; stroke: #6f8ff0; }
 .art-stop.now { fill: var(--ink); stroke: #6f8ff0; }
+.login-single { grid-template-columns: 1fr; background: var(--paper); }
+.login-single .login-card { background: var(--surface); border: 1px solid var(--rule); border-radius: var(--r-panel); box-shadow: var(--shadow); }
 .login-card { align-self: center; justify-self: center; width: 100%; max-width: 380px; padding: 32px; display: flex; flex-direction: column; gap: 14px; }
 
 /* ---------- Responsive ---------- */

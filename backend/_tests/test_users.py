@@ -38,7 +38,17 @@ s, x = call(users, "POST", "/api/users", {"name": "Xavier", "email": f"x@{TAG}.t
 check("dup email", call(users, "POST", "/api/users", {"name": "Dup", "email": f"ELI@{TAG}.test", "role": "employee"}, A), 409)
 check("employee as manager rejected", call(users, "POST", "/api/users", {"name": "Bad", "email": f"bad@{TAG}.test", "role": "employee", "manager_id": e1["user"]["id"]}, A), 400)
 print("  username sample:", e1["user"]["username"], "emp#", e1["user"]["employee_number"])
-lg = lambda u, p: call(auth, "POST", "/api/auth/login", {"username": u, "password": p})[1]["token"]
+def first_login(username, temp_password, ip=None):
+    """Sign in with a temporary password and set a real one, as every new user must."""
+    token = call(auth, "POST", "/api/auth/login", {"username": username, "password": temp_password}, **({"ip": ip} if ip else {}))[1]["token"]
+    call(auth, "POST", "/api/auth/change-password", {"current_password": temp_password, "new_password": "Passw0rd!"}, token)
+    return token
+temp_tok = call(auth, "POST", "/api/auth/login", {"username": e1["user"]["username"], "password": e1["temporary_password"]})[1]
+assert temp_tok["user"]["must_change_password"] is True; print("PASS new user must change temporary password")
+check("temporary password blocks other pages", call(users, "GET", "/api/users", None, temp_tok["token"]), 403)
+check("temporary password still allows /me", call(auth, "GET", "/api/auth/me", None, temp_tok["token"]), 200)
+check("new password must differ", call(auth, "POST", "/api/auth/change-password", {"current_password": e1["temporary_password"], "new_password": e1["temporary_password"]}, temp_tok["token"]), 400)
+lg = lambda u, p: first_login(u, p)
 M = lg(m["user"]["username"], m["temporary_password"]); E = lg(e1["user"]["username"], e1["temporary_password"])
 s, b = call(users, "GET", "/api/users", None, E); names = sorted(u["name"] for u in b["users"])
 print("  employee sees:", names, "| pay visible on teammate:", any("pay_rate" in u for u in b["users"] if u["name"] == "Eve Two")); assert names == ["Eli One", "Eve Two", "Maria Manager"]
@@ -57,7 +67,9 @@ check("archive employee", call(users, "POST", f"/api/users/{x['user']['id']}/arc
 s, b = call(auth, "POST", "/api/auth/login", {"username": x["user"]["username"], "password": x["temporary_password"]}); check("archived cannot log in", (s, b), 403)
 check("search", call(users, "GET", "/api/users", None, A, {"q": "eve"}), 200)
 check("unarchive", call(users, "POST", f"/api/users/{x['user']['id']}/unarchive", None, A), 200)
-check("reset password", call(users, "POST", f"/api/users/{e1['user']['id']}/reset-password", None, A), 200)
+rp_res = call(users, "POST", f"/api/users/{e1['user']['id']}/reset-password", None, A); check("reset password", rp_res, 200); rp = rp_res[1]
+t2 = call(auth, "POST", "/api/auth/login", {"username": e1["user"]["username"], "password": rp["temporary_password"]})[1]
+assert t2["user"]["must_change_password"] is True; print("PASS reset password forces a new change")
 check("employee cannot create", call(users, "POST", "/api/users", {"name": "Z", "email": f"z@{TAG}.test", "role": "employee"}, E), 403)
 check("admin cannot demote self", call(users, "PATCH", f"/api/users/{admin_id}", {"role": "employee"}, A), 400)
 check("bad id", call(users, "GET", "/api/users/notauuid", None, A), 400)

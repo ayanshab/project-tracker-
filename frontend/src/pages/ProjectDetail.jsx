@@ -298,11 +298,11 @@ function Team({ project, manage, reload }) {
             <tbody>
               {members.map((x) => (
                 <tr key={x.user_id}>
-                  <td>{x.name}<div className="muted small">{x.email}</div></td>
+                  <td>{x.name}<div className="muted small">{x.other_team ? 'Another team' : x.email}</div></td>
                   <td>{x.job_title || '–'}</td>
                   <td className="r num">{x.hours_per_week}</td>
                   <td>{fmtShort(x.assigned_from)} to {x.assigned_to ? fmtShort(x.assigned_to) : 'project end'}</td>
-                  <td className="r num">{fmtHours(x.hours_logged)}</td>
+                  <td className="r num">{x.hours_logged === undefined ? '–' : fmtHours(x.hours_logged)}</td>
                   {manage && (
                     <td className="r nowrap">
                       <button className="link-btn" onClick={() => setEditing(x)}>Change hours</button>

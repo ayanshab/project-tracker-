@@ -17,6 +17,7 @@ import os
 
 from common import (
     ApiError,
+    audit,
     error,
     get_current_user,
     hash_password,
@@ -43,10 +44,12 @@ def seed_admin():
         return
     count = query_one("SELECT COUNT(*) AS n FROM users")["n"]
     if count == 0:
+        # In the cloud, the built-in default password must be changed at first sign-in.
+        force_change = os.getenv("IS_LOCAL") == "false" and not os.getenv("ADMIN_PASSWORD")
         execute(
             """
-            INSERT INTO users (username, password_hash, name, email, job_title, role)
-            VALUES (%s, %s, %s, %s, %s, 'admin')
+            INSERT INTO users (username, password_hash, name, email, job_title, role, must_change_password)
+            VALUES (%s, %s, %s, %s, %s, 'admin', %s)
             """,
             (
                 "admin",
@@ -54,6 +57,7 @@ def seed_admin():
                 "System Administrator",
                 "admin@acme.local",
                 "Administrator",
+                force_change,
             ),
         )
         logger.info("Seeded initial admin account")
@@ -66,28 +70,36 @@ def login(body):
         "SELECT * FROM users WHERE username = %s", (body["username"].strip(),)
     )
     if not user or not verify_password(body["password"], user["password_hash"]):
+        audit(user if user else None, "auth.login_failed", "user", user and user["id"],
+              user["name"] if user else None, {"username": body["username"].strip()[:100]})
         raise ApiError(401, "Invalid username or password")
     if user["is_archived"]:
+        audit(user, "auth.login_blocked", "user", user["id"], user["name"], {"reason": "archived"})
         raise ApiError(403, "This account has been archived")
+    audit(user, "auth.login", "user", user["id"], user["name"])
     return response(200, {"token": make_token(user), "user": public_user(user)})
 
 
 def me(headers):
-    return response(200, {"user": get_current_user(headers)})
+    return response(200, {"user": get_current_user(headers, allow_pending=True)})
 
 
 def change_password(headers, body):
-    user = get_current_user(headers)
+    user = get_current_user(headers, allow_pending=True)
     require_fields(body, "current_password", "new_password")
     if len(body["new_password"]) < 8:
         raise ApiError(400, "New password must be at least 8 characters")
+    if body["new_password"] == body["current_password"]:
+        raise ApiError(400, "Choose a password different from your current one")
     stored = query_one("SELECT password_hash FROM users WHERE id = %s", (user["id"],))
     if not verify_password(body["current_password"], stored["password_hash"]):
+        audit(user, "auth.password_change_failed", "user", user["id"], user["name"])
         raise ApiError(401, "Current password is incorrect")
     execute(
-        "UPDATE users SET password_hash = %s, updated_at = now() WHERE id = %s",
+        "UPDATE users SET password_hash = %s, must_change_password = FALSE, updated_at = now() WHERE id = %s",
         (hash_password(body["new_password"]), user["id"]),
     )
+    audit(user, "auth.password_change", "user", user["id"], user["name"])
     return response(200, {"message": "Password updated"})
 
 

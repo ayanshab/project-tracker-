@@ -26,7 +26,12 @@ def check(label, got, want):
 tag = uuid.uuid4().hex[:6]
 A = call(auth, "POST", "/api/auth/login", {"username": "admin", "password": "Admin123!"})[1]["token"]
 mk = lambda n, r, mgr=None: call(users, "POST", "/api/users", {"name": n, "email": f"{n.lower()}.{tag}@t.com", "role": r, "manager_id": mgr, "pay_rate": 50}, A)[1]
-lg = lambda u: call(auth, "POST", "/api/auth/login", {"username": u["user"]["username"], "password": u["temporary_password"]})[1]["token"]
+def first_login(username, temp_password, ip=None):
+    """Sign in with a temporary password and set a real one, as every new user must."""
+    token = call(auth, "POST", "/api/auth/login", {"username": username, "password": temp_password}, **({"ip": ip} if ip else {}))[1]["token"]
+    call(auth, "POST", "/api/auth/change-password", {"current_password": temp_password, "new_password": "Passw0rd!"}, token)
+    return token
+lg = lambda u: first_login(u["user"]["username"], u["temporary_password"])
 m = mk("Mgr", "manager"); e1 = mk("Ann", "employee", m["user"]["id"]); e2 = mk("Ben", "employee", m["user"]["id"]); out = mk("Out", "employee", m["user"]["id"])
 M, E1, E2, O = lg(m), lg(e1), lg(e2), lg(out)
 p = call(proj, "POST", "/api/projects", {"name": f"Plan {tag}", "start_date": "2026-01-01", "end_date": "2026-12-31"}, M)[1]["project"]

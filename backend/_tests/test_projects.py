@@ -29,7 +29,12 @@ def check(label, got, want):
     ok = got[0] == want; print(("PASS" if ok else "FAIL"), label, got[0], "" if ok else got[1]); assert ok; return got[1]
 A = call(auth, "POST", "/api/auth/login", {"username": "admin", "password": "Admin123!"})[1]["token"]
 mk = lambda n, e, r, mgr=None, pay=50: call(users, "POST", "/api/users", {"name": n, "email": e, "role": r, "manager_id": mgr, "pay_rate": pay}, A)[1]
-lg = lambda u: call(auth, "POST", "/api/auth/login", {"username": u["user"]["username"], "password": u["temporary_password"]})[1]["token"]
+def first_login(username, temp_password, ip=None):
+    """Sign in with a temporary password and set a real one, as every new user must."""
+    token = call(auth, "POST", "/api/auth/login", {"username": username, "password": temp_password}, **({"ip": ip} if ip else {}))[1]["token"]
+    call(auth, "POST", "/api/auth/change-password", {"current_password": temp_password, "new_password": "Passw0rd!"}, token)
+    return token
+lg = lambda u: first_login(u["user"]["username"], u["temporary_password"])
 m = mk("Maria", f"maria@{TAG}.test", "manager"); m2 = mk("Omar", f"omar@{TAG}.test", "manager")
 e1 = mk("Eli", f"eli@{TAG}.test", "employee", m["user"]["id"], 40); e2 = mk("Eve", f"eve@{TAG}.test", "employee", m2["user"]["id"])
 M, M2, E = lg(m), lg(m2), lg(e1)
@@ -74,6 +79,11 @@ s, b = call(proj, "GET", P, None, A, {"archived": "true"}); print("    admin arc
 check("manager cannot unarchive", call(proj, "POST", f"{P}/{p1['id']}/unarchive", None, M), 403)
 check("admin unarchive", call(proj, "POST", f"{P}/{p1['id']}/unarchive", None, A), 200)
 check("Eli's Apollo hours no longer count after completion (assign 30 more on Borealis)", call(proj, "PATCH", f"{P}/{p2['id']}/members/{e1['user']['id']}", {"hours_per_week": 40}, A), 200)
+check("admin adds Eve (Omar's team) to Borealis", call(proj, "POST", f"{P}/{p2['id']}/members", {"user_id": e2["user"]["id"], "hours_per_week": 5}, A), 201)
+s, b = call(proj, "GET", f"{P}/{p2['id']}", None, E)
+eve = next(x for x in b["project"]["members"] if x["user_id"] == e2["user"]["id"]); me = next(x for x in b["project"]["members"] if x["user_id"] == e1["user"]["id"])
+assert eve.get("other_team") and "email" not in eve and "hours_logged" not in eve and "email" in me
+print("PASS employee sees other-team colleague by name only:", sorted(eve.keys()))
 check("remove member", call(proj, "DELETE", f"{P}/{p2['id']}/members/{e1['user']['id']}", None, A), 200)
 check("search", call(proj, "GET", P, None, A, {"q": "borea"}), 200)
 check("archiving manager with active project blocked", call(users, "POST", f"/api/users/{m2['user']['id']}/archive", None, A), 409)

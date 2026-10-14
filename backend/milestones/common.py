@@ -16,11 +16,25 @@ import time
 from datetime import date, datetime
 from decimal import Decimal
 
-from db import query_one
+from db import execute, query_one
 
 logger = logging.getLogger()
 
-AUTH_SECRET = os.getenv("AUTH_SECRET", "dev-only-secret-change-me").encode()
+
+def _auth_secret():
+    """Signing key for login tokens.
+
+    Uses AUTH_SECRET when set. Otherwise derives a key from the database
+    credentials, which every service already receives as secret environment
+    variables, so no signing key ever lives in source code."""
+    explicit = os.getenv("AUTH_SECRET")
+    if explicit:
+        return explicit.encode()
+    seed = "|".join(os.getenv(k) or "" for k in ("POSTGRES_PASS", "POSTGRES_USER", "POSTGRES_HOST", "POSTGRES_NAME"))
+    return hashlib.sha256(f"project-tracker-auth:{seed}".encode()).digest()
+
+
+AUTH_SECRET = _auth_secret()
 TOKEN_TTL_SECONDS = 8 * 60 * 60
 
 CORS_HEADERS = {
@@ -76,6 +90,12 @@ def parse_event(event, service_name):
     headers = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
 
     ctx = event.get("requestContext") or {}
+    forwarded = (headers.get("x-forwarded-for") or "").split(",")[0].strip()
+    _REQUEST.clear()
+    _REQUEST.update(
+        ip=forwarded or (ctx.get("http") or {}).get("sourceIp") or (ctx.get("identity") or {}).get("sourceIp"),
+        user_agent=(headers.get("user-agent") or "")[:300] or None,
+    )
     method = (
         (ctx.get("http") or {}).get("method")
         or event.get("httpMethod")
@@ -176,7 +196,7 @@ def parse_token(token):
 
 PUBLIC_USER_COLUMNS = (
     "id, employee_number, username, name, email, job_title, role, "
-    "manager_id, pay_rate, is_archived, created_at, updated_at"
+    "manager_id, pay_rate, is_archived, must_change_password, created_at, updated_at"
 )
 
 
@@ -187,8 +207,11 @@ def public_user(row):
     return {k: v for k, v in row.items() if k != "password_hash"}
 
 
-def get_current_user(headers):
-    """Return the logged-in user row or raise 401."""
+def get_current_user(headers, allow_pending=False):
+    """Return the logged-in user row or raise 401.
+
+    Users still on a temporary password are blocked from everything except
+    viewing their own account and changing the password (allow_pending=True)."""
     auth = headers.get("authorization", "")
     if not auth.lower().startswith("bearer "):
         raise ApiError(401, "Missing bearer token")
@@ -201,9 +224,59 @@ def get_current_user(headers):
     )
     if not user:
         raise ApiError(401, "User not found or archived")
+    if user["must_change_password"] and not allow_pending:
+        raise ApiError(403, "Change your temporary password before continuing")
     return user
 
 
 def require_role(user, *roles):
     if user["role"] not in roles:
         raise ApiError(403, f"Requires role: {', '.join(roles)}")
+
+
+# ---------- Audit log ----------
+
+_REQUEST = {}  # source IP and user agent of the request being handled (one per Lambda invocation)
+
+
+def audit(actor, action, entity_type, entity_id=None, entity_name=None, details=None):
+    """Append one entry to the audit log. Never record passwords or tokens here.
+
+    actor: the user row performing the action (or None for anonymous events such as a failed login).
+    action: a short verb phrase like 'project.create' or 'user.archive'.
+    """
+    try:
+        execute(
+            """
+            INSERT INTO audit_log (actor_id, actor_name, actor_role, action, entity_type, entity_id,
+                                   entity_name, details, source_ip, user_agent)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s)
+            """,
+            (
+                actor["id"] if actor else None,
+                actor["name"] if actor else None,
+                actor["role"] if actor else None,
+                action, entity_type,
+                str(entity_id) if entity_id is not None else None,
+                entity_name,
+                json.dumps(details or {}, default=_json_default),
+                _REQUEST.get("ip"), _REQUEST.get("user_agent"),
+            ),
+        )
+    except Exception:  # noqa: BLE001 - auditing must never hide the result of the action itself
+        logger.exception("Failed to write audit log entry for %s", action)
+
+
+def changes(before, body, fields):
+    """{field: [old, new]} for the fields in body that actually change."""
+    out = {}
+    for f in fields:
+        if f in body:
+            old, new = before.get(f), body[f]
+            try:
+                same = float(old) == float(new)
+            except (TypeError, ValueError):
+                same = str(old if old is not None else "").strip() == str(new if new is not None else "").strip()
+            if not same:
+                out[f] = [old, new]
+    return out

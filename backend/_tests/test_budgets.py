@@ -30,7 +30,12 @@ today = date.today(); last_mon = today - timedelta(days=today.weekday() + 7)
 d = lambda n: (last_mon + timedelta(days=n)).isoformat()
 A = call(auth, "POST", "/api/auth/login", {"username": "admin", "password": "Admin123!"})[1]["token"]
 mk = lambda n, r, mgr=None, pay=50: call(users, "POST", "/api/users", {"name": n, "email": f"{n.lower()}.{tag}@t.com", "role": r, "manager_id": mgr, "pay_rate": pay}, A)[1]
-lg = lambda u: call(auth, "POST", "/api/auth/login", {"username": u["user"]["username"], "password": u["temporary_password"]})[1]["token"]
+def first_login(username, temp_password, ip=None):
+    """Sign in with a temporary password and set a real one, as every new user must."""
+    token = call(auth, "POST", "/api/auth/login", {"username": username, "password": temp_password}, **({"ip": ip} if ip else {}))[1]["token"]
+    call(auth, "POST", "/api/auth/change-password", {"current_password": temp_password, "new_password": "Passw0rd!"}, token)
+    return token
+lg = lambda u: first_login(u["user"]["username"], u["temporary_password"])
 m = mk("Mgr", "manager", pay=80); e1 = mk("Ann", "employee", m["user"]["id"], 40); e2 = mk("Ben", "employee", m["user"]["id"], 30)
 M, E1, E2 = lg(m), lg(e1), lg(e2)
 start = (today - timedelta(days=60)).isoformat(); end = (today + timedelta(days=60)).isoformat()
