@@ -15,7 +15,6 @@ sys.path.insert(0, os.path.join(BACKEND, "auth"))
 def load(n):
     s = importlib.util.spec_from_file_location(n, os.path.join(BACKEND, n, "function.py")); m = importlib.util.module_from_spec(s); s.loader.exec_module(m); return m
 auth, users, proj, mil, bud = (load(n) for n in ("auth", "users", "projects", "milestones", "budgets"))
-import db
 def call(mod, method, path, body=None, token=None, qs=None, ip=None):
     ev = {"rawPath": path, "requestContext": {"http": {"method": method, "sourceIp": "10.0.0.9"}}, "headers": {"User-Agent": "audit-test"}, "queryStringParameters": qs}
     if ip: ev["headers"]["X-Forwarded-For"] = ip
