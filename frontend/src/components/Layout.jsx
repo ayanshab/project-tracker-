@@ -15,9 +15,12 @@ const NAV = {
     ['/approvals', 'Approvals'],
     ['/archive', 'Archive'],
     ['/audit', 'Audit log'],
+    ['/my-work', 'My work'],
+    ['/time', 'My time'],
   ],
   manager: [
     ['/', 'Overview'],
+    ['/my-work', 'My work'],
     ['/projects', 'Projects'],
     ['/people', 'My team'],
     ['/allocation', 'Allocation'],

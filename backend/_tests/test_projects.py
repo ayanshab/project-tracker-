@@ -55,7 +55,10 @@ check("raising Apollo to 31h blocked", call(proj, "PATCH", f"{P}/{p1['id']}/memb
 check("lowering Apollo to 25h ok", call(proj, "PATCH", f"{P}/{p1['id']}/members/{e1['user']['id']}", {"hours_per_week": 25}, M), 200)
 s, b = call(proj, "GET", P, None, E); print("    employee sees:", [p["name"] for p in b["projects"]]); assert len(b["projects"]) == 2
 s, b = call(proj, "GET", f"{P}/{p1['id']}", None, E); assert "planned_budget" not in b["project"]; print("PASS employee detail hides budget")
-check("Omar cannot see Apollo", call(proj, "GET", f"{P}/{p1['id']}", None, M2), 404)
+check("Omar staffs himself on Borealis", call(proj, "POST", f"{P}/{p2['id']}/members", {"user_id": m2["user"]["id"], "hours_per_week": 10}, M2), 201)
+s, b = call(proj, "GET", P, None, M2, {"mine": "true"}); assert [p["name"] for p in b["projects"]] == ["Borealis"]; print("PASS manager mine=true lists staffed projects")
+s, b = call(proj, "GET", P, None, M, {"mine": "true"}); assert b["projects"] == []; print("PASS manager not staffed sees none with mine=true")
+check("Omar cannot see Apollo",call(proj, "GET", f"{P}/{p1['id']}", None, M2), 404)
 check("Omar cannot edit Apollo", call(proj, "PATCH", f"{P}/{p1['id']}", {"name": "Hack"}, M2), 404)
 check("manager edits own project", call(proj, "PATCH", f"{P}/{p1['id']}", {"name": "Apollo v2", "end_date": "2027-01-31"}, M), 200)
 check("manager cannot change project manager", call(proj, "PATCH", f"{P}/{p1['id']}", {"manager_id": m2["user"]["id"]}, M), 403)

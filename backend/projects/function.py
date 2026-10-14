@@ -408,6 +408,10 @@ def list_projects(viewer, params):
         where.append("(p.manager_id = %s OR EXISTS (SELECT 1 FROM project_members x "
                      "WHERE x.project_id = p.id AND x.user_id = %s))")
         args += [viewer["id"], viewer["id"]]
+    if str(params.get("mine", "")).lower() == "true":
+        # Only projects the caller is staffed on (a manager's own hands-on work).
+        where.append("EXISTS (SELECT 1 FROM project_members y WHERE y.project_id = p.id AND y.user_id = %s)")
+        args.append(viewer["id"])
     if params.get("status") in ("active", "completed"):
         where.append("p.status = %s")
         args.append(params["status"])

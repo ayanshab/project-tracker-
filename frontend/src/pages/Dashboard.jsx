@@ -89,13 +89,19 @@ function ManagerHome({ user }) {
   )
 }
 
+// Managers and admins can also be staffed on projects; this gives them the same hands-on view.
+export function MyWork() {
+  const { user } = useAuth()
+  return <EmployeeHome user={user} />
+}
+
 function EmployeeHome({ user }) {
   const act = useAction()
   const { data, error, loading, reload } = useApi(async () => {
     const [mine, week, projects] = await Promise.all([
       api.get('/milestones/mine'),
       api.get('/budgets/time/week'),
-      api.get('/projects'),
+      api.get('/projects', { mine: true }),
     ])
     return { milestones: mine.milestones, week, projects: projects.projects }
   })

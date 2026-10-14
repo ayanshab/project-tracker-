@@ -3,7 +3,7 @@ import { AuthProvider, useAuth } from './context/AuthContext'
 import { Loading, ToastProvider } from './components/ui'
 import Layout from './components/Layout'
 import Login from './pages/Login'
-import Dashboard from './pages/Dashboard'
+import Dashboard, { MyWork } from './pages/Dashboard'
 import Projects from './pages/Projects'
 import ProjectDetail from './pages/ProjectDetail'
 import People from './pages/People'
@@ -34,6 +34,7 @@ function AppRoutes() {
         <Route path="projects/:id" element={<ProjectDetail />} />
         <Route path="people" element={<People />} />
         <Route path="time" element={<TimeLog />} />
+        <Route path="my-work" element={<RequireRole roles={['admin', 'manager']}><MyWork /></RequireRole>} />
         <Route path="profile" element={<Profile />} />
         <Route path="allocation" element={<RequireRole roles={['admin', 'manager']}><Allocation /></RequireRole>} />
         <Route path="budgets" element={<RequireRole roles={['admin', 'manager']}><Budgets /></RequireRole>} />
