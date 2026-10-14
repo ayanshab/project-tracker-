@@ -37,7 +37,7 @@ export default function Login() {
         <p className="page-sub">Use the username and password your administrator gave you.</p>
         <label className="field">
           <span className="field-label">Username</span>
-          <input name="username" autoComplete="username" required autoFocus />
+          <input name="username" autoComplete="username" autoCapitalize="none" autoCorrect="off" spellCheck={false} required autoFocus />
         </label>
         <label className="field">
           <span className="field-label">Password</span>

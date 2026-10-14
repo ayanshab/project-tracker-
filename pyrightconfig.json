@@ -1,0 +1,7 @@
+{
+  "//": "Editor setup only. Lets VS Code (Pylance) find psycopg and the shared db/common modules, which are installed inside each backend service folder for Lambda packaging.",
+  "include": ["backend"],
+  "exclude": ["**/psycopg*", "**/node_modules", "**/__pycache__", "infra", "frontend"],
+  "extraPaths": ["backend/auth"],
+  "reportMissingModuleSource": "none"
+}
