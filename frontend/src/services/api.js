@@ -34,7 +34,24 @@ export function setUnauthorizedHandler(fn) {
   onUnauthorized = fn
 }
 
+// The cloud database pauses when idle and takes a few seconds to wake. The backend answers 503
+// (or CloudFront 504) meanwhile, so wait and retry quietly before showing an error.
+const RETRY_STATUSES = new Set([503, 504])
+const RETRY_DELAYS_MS = [2000, 4000, 6000]
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
 async function request(method, path, body, params) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await requestOnce(method, path, body, params)
+    } catch (err) {
+      if (!(err instanceof ApiError) || !RETRY_STATUSES.has(err.status) || attempt >= RETRY_DELAYS_MS.length) throw err
+      await sleep(RETRY_DELAYS_MS[attempt])
+    }
+  }
+}
+
+async function requestOnce(method, path, body, params) {
   const url = new URL(`${BASE}/api${path}`, window.location.origin)
   Object.entries(params || {}).forEach(([k, v]) => {
     if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, v)

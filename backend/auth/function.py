@@ -28,7 +28,7 @@ from common import (
     response,
     verify_password,
 )
-from db import ensure_schema, execute, query_one
+from db import DatabaseUnavailable, ensure_schema, execute, query_one
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -134,6 +134,9 @@ def handler(event=None, context=None):
 
     except ApiError as e:
         return error(e.status, e.message)
+    except DatabaseUnavailable:
+        logger.warning("Database unavailable: asking the client to retry")
+        return error(503, "The database is starting up. Try again in a few seconds.")
     except Exception as e:  # noqa: BLE001
         logger.exception("Unhandled error")
         return error(500, str(e))

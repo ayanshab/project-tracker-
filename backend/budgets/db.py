@@ -25,13 +25,38 @@ PG_CONFIG = (
 _CONN = None
 _SCHEMA_READY = False
 
+# Aurora Serverless can pause when idle and needs ~15-30 s to resume. Keep retrying the
+# connection for up to CONNECT_DEADLINE seconds (below CloudFront's 30 s origin timeout).
+CONNECT_DEADLINE = float(os.getenv("DB_CONNECT_DEADLINE", "25"))
+CONNECT_ATTEMPT_TIMEOUT = 8
+
+
+class DatabaseUnavailable(Exception):
+    """The database did not accept a connection in time (usually because it is waking up)."""
+
 
 def get_conn():
-    """Return the pooled connection, opening a new one if needed."""
+    """Return the pooled connection, opening a new one if needed (retrying while the database wakes)."""
     global _CONN
-    if _CONN is None or _CONN.closed:
-        _CONN = connect(PG_CONFIG, row_factory=dict_row, autocommit=True)
-    return _CONN
+    if _CONN is not None and not _CONN.closed:
+        return _CONN
+    import time
+    from psycopg import OperationalError
+
+    started = time.monotonic()
+    last = None
+    while time.monotonic() - started < CONNECT_DEADLINE:
+        remaining = CONNECT_DEADLINE - (time.monotonic() - started)
+        timeout = max(2, min(CONNECT_ATTEMPT_TIMEOUT, int(remaining)))
+        try:
+            _CONN = connect(PG_CONFIG.replace("connect_timeout=15", f"connect_timeout={timeout}"),
+                            row_factory=dict_row, autocommit=True)
+            return _CONN
+        except OperationalError as e:
+            last = e
+            logger.warning("Database not reachable yet (%s); retrying", str(e).strip()[:120])
+            time.sleep(1)
+    raise DatabaseUnavailable(str(last) if last else "database unavailable")
 
 
 def _reset():
