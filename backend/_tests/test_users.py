@@ -1,0 +1,65 @@
+"""
+End-to-end tests for the backend services, run directly against PostgreSQL.
+
+Usage (from the repo root, with local PostgreSQL running):
+    python3 backend/_tests/test_users.py
+
+WARNING: creates test users and projects in the target database.
+Point it at a scratch database with the POSTGRES_* variables, for example:
+    POSTGRES_NAME=test_db python3 backend/_tests/test_users.py
+"""
+import os, sys, json, importlib.util
+BACKEND = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+for k, v in {"POSTGRES_HOST": "localhost", "POSTGRES_PORT": "5432", "POSTGRES_USER": "postgres",
+             "POSTGRES_PASS": "postgres123", "POSTGRES_NAME": "postgres"}.items():
+    os.environ.setdefault(k, v)
+sys.path.insert(0, os.path.join(BACKEND, "auth"))
+def load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m); return m
+auth = load("auth_fn", os.path.join(BACKEND, "auth", "function.py"))
+users = load("users_fn", os.path.join(BACKEND, "users", "function.py"))
+def call(mod, method, path, body=None, token=None, qs=None):
+    ev = {"rawPath": path, "requestContext": {"http": {"method": method}}, "headers": {}, "queryStringParameters": qs}
+    if token: ev["headers"]["Authorization"] = "Bearer " + token
+    if body is not None: ev["body"] = json.dumps(body)
+    r = mod.handler(ev); return r["statusCode"], json.loads(r["body"])
+def check(label, got, want):
+    ok = got[0] == want; print(("PASS" if ok else "FAIL"), label, got[0], "" if ok else got[1]); assert ok
+s, b = call(auth, "POST", "/api/auth/login", {"username": "admin", "password": "Admin123!"}); assert s == 200
+A = b["token"]; admin_id = b["user"]["id"]
+check("no token", call(users, "GET", "/api/users"), 401)
+s, m = call(users, "POST", "/api/users", {"name": "Maria Manager", "email": "maria@acme.com", "role": "manager", "job_title": "PM", "pay_rate": 60}, A); check("create manager", (s, m), 201)
+s, e1 = call(users, "POST", "/api/users", {"name": "Eli One", "email": "eli@acme.com", "role": "employee", "manager_id": m["user"]["id"], "pay_rate": 40}, A); check("create emp1", (s, e1), 201)
+s, e2 = call(users, "POST", "/api/users", {"name": "Eve Two", "email": "eve@acme.com", "role": "employee", "manager_id": m["user"]["id"], "pay_rate": 42}, A); check("create emp2", (s, e2), 201)
+s, o = call(users, "POST", "/api/users", {"name": "Other Mgr", "email": "om@acme.com", "role": "manager"}, A); check("create mgr2", (s, o), 201)
+s, x = call(users, "POST", "/api/users", {"name": "Xavier", "email": "x@acme.com", "role": "employee", "manager_id": o["user"]["id"]}, A); check("create other-team emp", (s, x), 201)
+check("dup email", call(users, "POST", "/api/users", {"name": "Dup", "email": "ELI@acme.com", "role": "employee"}, A), 409)
+check("employee as manager rejected", call(users, "POST", "/api/users", {"name": "Bad", "email": "bad@acme.com", "role": "employee", "manager_id": e1["user"]["id"]}, A), 400)
+print("  username sample:", e1["user"]["username"], "emp#", e1["user"]["employee_number"])
+lg = lambda u, p: call(auth, "POST", "/api/auth/login", {"username": u, "password": p})[1]["token"]
+M = lg(m["user"]["username"], m["temporary_password"]); E = lg(e1["user"]["username"], e1["temporary_password"])
+s, b = call(users, "GET", "/api/users", None, E); names = sorted(u["name"] for u in b["users"])
+print("  employee sees:", names, "| pay visible on teammate:", any("pay_rate" in u for u in b["users"] if u["name"] == "Eve Two")); assert names == ["Eli One", "Eve Two", "Maria Manager"]
+s, b = call(users, "GET", "/api/users", None, M); print("  manager sees:", sorted(u["name"] for u in b["users"]))
+check("employee cannot view other team", call(users, "GET", f"/api/users/{x['user']['id']}", None, E), 404)
+check("employee edits own email", call(users, "PATCH", f"/api/users/{e1['user']['id']}", {"email": "eli.one@acme.com"}, E), 200)
+check("employee cannot edit teammate", call(users, "PATCH", f"/api/users/{e2['user']['id']}", {"name": "Hacked"}, E), 403)
+check("employee cannot change own title", call(users, "PATCH", f"/api/users/{e1['user']['id']}", {"job_title": "CEO"}, E), 403)
+check("manager edits report name", call(users, "PATCH", f"/api/users/{e2['user']['id']}", {"name": "Eve Second"}, M), 200)
+check("manager cannot reassign manager", call(users, "PATCH", f"/api/users/{e2['user']['id']}", {"manager_id": o["user"]["id"]}, M), 403)
+check("manager cannot edit other team", call(users, "PATCH", f"/api/users/{x['user']['id']}", {"name": "Nope"}, M), 404)
+check("admin reassigns manager", call(users, "PATCH", f"/api/users/{e2['user']['id']}", {"manager_id": o["user"]["id"]}, A), 200)
+check("reporting loop blocked", call(users, "PATCH", f"/api/users/{m['user']['id']}", {"manager_id": m["user"]["id"]}, A), 400)
+check("cannot archive manager w/ reports", call(users, "POST", f"/api/users/{o['user']['id']}/archive", None, A), 409)
+check("archive employee", call(users, "POST", f"/api/users/{x['user']['id']}/archive", None, A), 200)
+s, b = call(auth, "POST", "/api/auth/login", {"username": x["user"]["username"], "password": x["temporary_password"]}); check("archived cannot log in", (s, b), 403)
+check("search", call(users, "GET", "/api/users", None, A, {"q": "eve"}), 200)
+check("unarchive", call(users, "POST", f"/api/users/{x['user']['id']}/unarchive", None, A), 200)
+check("reset password", call(users, "POST", f"/api/users/{e1['user']['id']}/reset-password", None, A), 200)
+check("employee cannot create", call(users, "POST", "/api/users", {"name": "Z", "email": "z@a.com", "role": "employee"}, E), 403)
+check("admin cannot demote self", call(users, "PATCH", f"/api/users/{admin_id}", {"role": "employee"}, A), 400)
+check("bad id", call(users, "GET", "/api/users/notauuid", None, A), 400)
+print("ALL USERS TESTS PASSED")
+check("mgr2 reports to maria", call(users, "PATCH", f"/api/users/{o['user']['id']}", {"manager_id": m["user"]["id"]}, A), 200)
+check("true loop blocked", call(users, "PATCH", f"/api/users/{m['user']['id']}", {"manager_id": o["user"]["id"]}, A), 400)
+print("LOOP TEST PASSED")
