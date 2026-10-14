@@ -49,6 +49,17 @@ check("temporary password blocks other pages", call(users, "GET", "/api/users", 
 check("temporary password still allows /me", call(auth, "GET", "/api/auth/me", None, temp_tok["token"]), 200)
 check("new password must differ", call(auth, "POST", "/api/auth/change-password", {"current_password": e1["temporary_password"], "new_password": e1["temporary_password"]}, temp_tok["token"]), 400)
 lg = lambda u, p: first_login(u, p)
+proj_mod = None
+
+# A second admin, because sensitive changes need someone other than the requester to approve them.
+_a2 = call(users, "POST", "/api/users", {"name": "Second Admin", "email": f"admin2@{TAG}.test", "role": "admin"}, A)[1]
+A2 = first_login(_a2["user"]["username"], _a2["temporary_password"])
+def approved(res, approver_token):
+    """res = (status, body) of a PATCH that created a pending change. Approves it and returns the approval."""
+    assert res[0] == 200 and res[1].get("pending_approval"), res
+    req = res[1]["pending_approval"]
+    svc = users if req["entity_type"] == "user" else proj_mod
+    return call(svc, "POST", f"/api/{req['entity_type']}s/approvals/{req['id']}/approve", {}, approver_token)
 M = lg(m["user"]["username"], m["temporary_password"]); E = lg(e1["user"]["username"], e1["temporary_password"])
 s, b = call(users, "GET", "/api/users", None, E); names = sorted(u["name"] for u in b["users"])
 print("  employee sees:", names, "| pay visible on teammate:", any("pay_rate" in u for u in b["users"] if u["name"] == "Eve Two")); assert names == ["Eli One", "Eve Two", "Maria Manager"]
@@ -60,7 +71,13 @@ check("employee cannot change own title", call(users, "PATCH", f"/api/users/{e1[
 check("manager edits report name", call(users, "PATCH", f"/api/users/{e2['user']['id']}", {"name": "Eve Second"}, M), 200)
 check("manager cannot reassign manager", call(users, "PATCH", f"/api/users/{e2['user']['id']}", {"manager_id": o["user"]["id"]}, M), 403)
 check("manager cannot edit other team", call(users, "PATCH", f"/api/users/{x['user']['id']}", {"name": "Nope"}, M), 404)
-check("admin reassigns manager", call(users, "PATCH", f"/api/users/{e2['user']['id']}", {"manager_id": o["user"]["id"]}, A), 200)
+check("manager change needs a reason", call(users, "PATCH", f"/api/users/{e2['user']['id']}", {"manager_id": o["user"]["id"]}, A), 400)
+check("admin requests manager change", (_r := call(users, "PATCH", f"/api/users/{e2['user']['id']}", {"manager_id": o["user"]["id"], "reason": "Moving to Omar's team"}, A)), 200)
+check("change not applied until approved", (200, None) if call(users, "GET", f"/api/users/{e2['user']['id']}", None, A)[1]["user"]["manager_id"] == m["user"]["id"] else (0, "applied early"), 200)
+check("admin cannot approve own request", call(users, "POST", f"/api/users/approvals/{_r[1]['pending_approval']['id']}/approve", {}, A), 403)
+check("manager cannot approve", call(users, "POST", f"/api/users/approvals/{_r[1]['pending_approval']['id']}/approve", {}, M), 403)
+check("second admin approves", approved(_r, A2), 200)
+assert call(users, "GET", f"/api/users/{e2['user']['id']}", None, A)[1]["user"]["manager_id"] == o["user"]["id"]; print("PASS manager changed after approval")
 check("reporting loop blocked", call(users, "PATCH", f"/api/users/{m['user']['id']}", {"manager_id": m["user"]["id"]}, A), 400)
 check("cannot archive manager w/ reports", call(users, "POST", f"/api/users/{o['user']['id']}/archive", None, A), 409)
 check("archive employee", call(users, "POST", f"/api/users/{x['user']['id']}/archive", None, A), 200)
@@ -74,6 +91,6 @@ check("employee cannot create", call(users, "POST", "/api/users", {"name": "Z", 
 check("admin cannot demote self", call(users, "PATCH", f"/api/users/{admin_id}", {"role": "employee"}, A), 400)
 check("bad id", call(users, "GET", "/api/users/notauuid", None, A), 400)
 print("ALL USERS TESTS PASSED")
-check("mgr2 reports to maria", call(users, "PATCH", f"/api/users/{o['user']['id']}", {"manager_id": m["user"]["id"]}, A), 200)
-check("true loop blocked", call(users, "PATCH", f"/api/users/{m['user']['id']}", {"manager_id": o["user"]["id"]}, A), 400)
+check("mgr2 reports to maria (approved)", approved(call(users, "PATCH", f"/api/users/{o['user']['id']}", {"manager_id": m["user"]["id"], "reason": "Reorg"}, A), A2), 200)
+check("true loop blocked", call(users, "PATCH", f"/api/users/{m['user']['id']}", {"manager_id": o["user"]["id"], "reason": "Reorg"}, A), 400)
 print("LOOP TEST PASSED")

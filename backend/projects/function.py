@@ -16,6 +16,12 @@ Routes (all under /api/projects, all require Authorization: Bearer <token>):
     POST   /{id}/members              -> assign {user_id, hours_per_week, assigned_from?, assigned_to?}
     PATCH  /{id}/members/{user_id}    -> change hours or dates
     DELETE /{id}/members/{user_id}    -> remove an assignment
+    POST   /approvals/{id}/approve|reject|cancel -> decide a pending project change
+
+Maker-checker: changes to planned_budget, budget_hours or manager_id are not applied directly.
+They become a pending request (a "reason" is required) that a different admin must approve.
+
+Forecast: every project carries an earned value forecast (SPI, CPI, forecast cost and finish date).
 
 Rules:
     - A project always has exactly one manager (admins pick it; managers own what they create).
@@ -26,12 +32,16 @@ Rules:
 
 import logging
 import re
-from datetime import date
+from datetime import date, timedelta
 
 from common import (
     ApiError,
     audit,
     changes,
+    decide_change_request,
+    pending_changes,
+    request_change,
+    split_sensitive,
     error,
     get_current_user,
     parse_event,
@@ -205,6 +215,121 @@ def _health(row, today=None):
     return out
 
 
+# ---------- Forecasting (earned value management) ----------
+
+MILESTONE_PROGRESS_SQL = """
+SELECT m.id, m.project_id, m.position, m.name, m.status, m.start_date, m.end_date,
+       COALESCE(t.total, 0) AS tasks_total, COALESCE(t.done, 0) AS tasks_completed
+FROM milestones m
+LEFT JOIN (SELECT milestone_id, COUNT(*) AS total, COUNT(*) FILTER (WHERE completed) AS done
+           FROM tasks GROUP BY milestone_id) t ON t.milestone_id = m.id
+"""
+
+
+def _earned_fraction(m):
+    """How much of a milestone's work is done: 100% when completed; for one in progress, the share
+    of tasks checked off, or 50% when it has no tasks (the standard 50/50 earned-value rule)."""
+    if m["status"] == "completed":
+        return 1.0
+    if m["status"] == "in_progress":
+        return m["tasks_completed"] / m["tasks_total"] if m["tasks_total"] else 0.5
+    return 0.0
+
+
+def _forecast(p, stops, today=None):
+    """Earned value forecast for one project.
+
+    PV (planned value) = share of work scheduled to be done by today, from milestone dates.
+    EV (earned value)  = share of work actually done, from milestone and task progress.
+    AC (actual cost)   = labor (hours x pay rate) plus other costs.
+    SPI = EV / PV (below 1 means behind schedule); CPI = EV$ / AC (below 1 means over cost).
+    Forecast cost (EAC) = budget / CPI; forecast finish = planned duration / SPI.
+    """
+    today = today or date.today()
+    if p["status"] == "completed":
+        return {"available": False, "reason": "Project is completed."}
+    if not stops:
+        return {"available": False, "reason": "Add milestones to get a forecast."}
+    if today < p["start_date"]:
+        return {"available": False, "reason": "Project has not started yet."}
+
+    durations = [max((m["end_date"] - m["start_date"]).days + 1, 1) for m in stops]
+    total = sum(durations)
+    pv = sum(d / total * min(max(((today - m["start_date"]).days + 1) / d, 0), 1) for m, d in zip(stops, durations))
+    ev = sum(d / total * _earned_fraction(m) for m, d in zip(stops, durations))
+    bac = float(p["planned_budget"])
+    ac = float(p["labor_cost"]) + float(p["other_cost"])
+    hours = float(p["hours_logged"])
+
+    if pv < 0.05:
+        return {"available": False, "reason": "Too early to forecast. Check back once more work is scheduled."}
+
+    spi = ev / pv if pv > 0 else None
+    cpi = (ev * bac) / ac if (ac > 0 and bac > 0 and ev > 0) else None
+    if cpi:
+        eac = bac / cpi
+    elif ac > 0 and ev > 0:
+        eac = ac / ev
+    else:
+        eac = None
+
+    planned_days = max((p["end_date"] - p["start_date"]).days, 1)
+    finish = None
+    if ev >= 0.999:
+        finish = today
+    elif spi and spi > 0:
+        finish = p["start_date"] + timedelta(days=round(planned_days / spi))
+        finish = max(finish, today + timedelta(days=1))  # unfinished work cannot end in the past
+    days_late = (finish - p["end_date"]).days if finish else None
+
+    def band(value, good, fair):
+        if value is None:
+            return None
+        return "good" if value >= good else "fair" if value >= fair else "poor"
+
+    return {
+        "available": True,
+        "planned_pct": round(100 * pv),
+        "earned_pct": round(100 * ev),
+        "planned_value": round(pv * bac, 2),
+        "earned_value": round(ev * bac, 2),
+        "actual_cost": round(ac, 2),
+        "spi": round(spi, 2) if spi is not None else None,
+        "cpi": round(cpi, 2) if cpi is not None else None,
+        "schedule_health": band(spi, 0.95, 0.8),
+        "cost_health": band(cpi, 0.95, 0.85),
+        "forecast_cost": round(eac, 2) if eac is not None else None,
+        "forecast_variance": round(bac - eac, 2) if (eac is not None and bac > 0) else None,
+        "forecast_hours": round(hours / ev, 1) if (ev > 0 and hours > 0) else None,
+        "forecast_finish": finish,
+        "days_late": days_late,
+        "confidence": "low" if ev < 0.2 else "medium" if ev < 0.5 else "high",
+    }
+
+
+def _apply_forecast(p, stops):
+    """Attach the forecast and replace rough heuristics with forecast-based risk reasons."""
+    f = _forecast(p, stops)
+    p["forecast"] = f
+    if not f["available"]:
+        return p
+    reasons = [r for r in p["risk_reasons"] if r not in ("Milestones behind schedule", "Spending ahead of schedule")]
+    if f["days_late"] is not None and f["days_late"] > 7 and "Past end date" not in reasons:
+        reasons.append(f"Forecast to finish {f['days_late']} days late")
+    bac = float(p["planned_budget"])
+    if f["forecast_variance"] is not None and bac > 0 and f["forecast_variance"] < -0.05 * bac and "Over budget" not in reasons:
+        reasons.append(f"Forecast ${-f['forecast_variance']:,.0f} over budget")
+    p["risk_reasons"] = reasons
+    p["at_risk"] = bool(reasons)
+    return p
+
+
+def _hide_cost_forecast(p):
+    f = p.get("forecast") or {}
+    for k in ("planned_value", "earned_value", "actual_cost", "cpi", "cost_health", "forecast_cost", "forecast_variance"):
+        f.pop(k, None)
+
+
 # ---------- Allocation ----------
 
 def _overlap_hours(user_id, start, end, exclude_project=None):
@@ -295,8 +420,7 @@ def list_projects(viewer, params):
     if projects:
         today = date.today()
         stops = query(
-            "SELECT id, project_id, position, name, status, start_date, end_date FROM milestones "
-            "WHERE project_id = ANY(%s) ORDER BY project_id, position",
+            f"{MILESTONE_PROGRESS_SQL} WHERE m.project_id = ANY(%s) ORDER BY m.project_id, m.position",
             ([p["id"] for p in projects],),
         )
         by_project = {}
@@ -305,15 +429,22 @@ def list_projects(viewer, params):
             by_project.setdefault(s["project_id"], []).append(s)
         for p in projects:
             p["milestones"] = by_project.get(p["id"], [])
+            _apply_forecast(p, p["milestones"])
+            if viewer["role"] == "employee":
+                _hide_cost_forecast(p)
+                for key in ("labor_cost", "other_cost", "total_cost", "planned_budget", "budget_used_pct"):
+                    p.pop(key, None)
     if str(params.get("at_risk", "")).lower() == "true":
         projects = [p for p in projects if p["at_risk"]]
     return response(200, {"projects": projects})
 
 
-def get_project(viewer, project_id):
+def _project_detail(viewer, project_id):
     project = _load_for(viewer, project_id)
     row = query_one(f"{STATS_SQL} WHERE p.id = %s", (project["id"],))
     detail = _health(row)
+    stops = query(f"{MILESTONE_PROGRESS_SQL} WHERE m.project_id = %s ORDER BY m.position", (project["id"],))
+    _apply_forecast(detail, stops)
     members = query(
         """
         SELECT u.id AS user_id, u.name, u.email, u.job_title, u.role,
@@ -333,7 +464,10 @@ def get_project(viewer, project_id):
     detail["members"] = members
     detail["milestones"] = milestones
     detail["can_manage"] = _can_manage(viewer, project)
+    if detail["can_manage"]:
+        detail["pending_changes"] = pending_changes("project", project["id"])
     if viewer["role"] == "employee":
+        _hide_cost_forecast(detail)
         for key in ("labor_cost", "other_cost", "total_cost", "planned_budget", "budget_used_pct"):
             detail.pop(key, None)
         # Employees only get full details for their immediate team (same manager) and their manager.
@@ -347,7 +481,11 @@ def get_project(viewer, project_id):
                 m.pop("email", None)
                 m.pop("hours_logged", None)
                 m["other_team"] = True
-    return response(200, {"project": detail})
+    return detail
+
+
+def get_project(viewer, project_id, status=200, **extra):
+    return response(status, {"project": _project_detail(viewer, project_id), **extra})
 
 
 def create_project(viewer, body):
@@ -380,54 +518,75 @@ def create_project(viewer, body):
     audit(viewer, "project.create", "project", row["id"], name, {
         "manager_id": manager_id, "start_date": start, "end_date": end,
         "budget_hours": body.get("budget_hours", 0), "planned_budget": body.get("planned_budget", 0)})
-    return get_project(viewer, row["id"]) | {"statusCode": 201}
+    return get_project(viewer, row["id"], status=201)
 
 
-def update_project(viewer, project_id, body):
-    project = _load_for(viewer, project_id, manage=True)
-    if project["status"] == "completed":
-        raise ApiError(409, "Completed projects cannot be edited")
-
-    sets, args = [], []
+def _validated_project_changes(viewer, project, body):
+    """Validate every field in body and return {column: clean value}. Applies nothing."""
+    out = {}
     if "name" in body:
-        sets.append("name = %s"); args.append(_text(body["name"], "name"))
+        out["name"] = _text(body["name"], "name")
     if "description" in body:
-        sets.append("description = %s")
-        args.append(_text(body["description"], "description", required=False, max_len=2000))
+        out["description"] = _text(body["description"], "description", required=False, max_len=2000)
     if "budget_hours" in body:
-        sets.append("budget_hours = %s"); args.append(_number(body["budget_hours"], "budget_hours"))
+        out["budget_hours"] = _number(body["budget_hours"], "budget_hours")
     if "planned_budget" in body:
-        sets.append("planned_budget = %s"); args.append(_number(body["planned_budget"], "planned_budget"))
+        out["planned_budget"] = _number(body["planned_budget"], "planned_budget")
     if "manager_id" in body:
         if viewer["role"] != "admin":
             raise ApiError(403, "Only an admin can change a project's manager")
-        sets.append("manager_id = %s"); args.append(_validate_project_manager(body["manager_id"]))
-
-    start = _date(body["start_date"], "start_date") if "start_date" in body else project["start_date"]
-    end = _date(body["end_date"], "end_date") if "end_date" in body else project["end_date"]
-    if end < start:
-        raise ApiError(400, "end_date must be on or after start_date")
+        out["manager_id"] = _validate_project_manager(body["manager_id"])
     if "start_date" in body or "end_date" in body:
+        start = _date(body["start_date"], "start_date") if "start_date" in body else project["start_date"]
+        end = _date(body["end_date"], "end_date") if "end_date" in body else project["end_date"]
+        if end < start:
+            raise ApiError(400, "end_date must be on or after start_date")
         outside = query_one(
             "SELECT name FROM milestones WHERE project_id = %s AND (start_date < %s OR end_date > %s) LIMIT 1",
             (project["id"], start, end),
         )
         if outside:
             raise ApiError(409, f"Milestone '{outside['name']}' falls outside the new dates. Adjust it first.")
-        sets += ["start_date = %s", "end_date = %s"]
-        args += [start, end]
+        out["start_date"], out["end_date"] = start, end
+    return out
 
-    if not sets:
-        raise ApiError(400, "No editable fields provided")
-    sets.append("updated_at = now()")
-    execute(f"UPDATE projects SET {', '.join(sets)} WHERE id = %s", args + [project["id"]])
+
+def _apply_project_changes(viewer, project, values, audit_extra=None):
+    if not values:
+        return
+    cols = list(values)
+    execute(
+        f"UPDATE projects SET {', '.join(f'{c} = %s' for c in cols)}, updated_at = now() WHERE id = %s",
+        [values[c] for c in cols] + [project["id"]],
+    )
     after = _project(project["id"])
-    diff = changes(project, after, ("name", "description", "start_date", "end_date",
-                                    "budget_hours", "planned_budget", "manager_id"))
+    diff = changes(project, after, cols)
     if diff:
         action = "project.reassign_manager" if "manager_id" in diff else "project.update"
-        audit(viewer, action, "project", project["id"], after["name"], {"changes": diff})
-    return get_project(viewer, project["id"])
+        audit(viewer, action, "project", project["id"], after["name"], {"changes": diff, **(audit_extra or {})})
+
+
+def update_project(viewer, project_id, body):
+    project = _load_for(viewer, project_id, manage=True)
+    if project["status"] == "completed":
+        raise ApiError(409, "Completed projects cannot be edited")
+    cleaned = _validated_project_changes(viewer, project, body)
+    if not cleaned:
+        raise ApiError(400, "No editable fields provided")
+    # Budget and project-manager changes need a second admin's approval (maker-checker).
+    now, later = split_sensitive("project", project, cleaned)
+    pending = request_change(viewer, "project", project, later, body.get("reason"))
+    _apply_project_changes(viewer, project, now)
+    return get_project(viewer, project["id"], pending_approval=pending)
+
+
+def apply_approved_project_change(approver, req):
+    project = _project(str(req["entity_id"]))
+    if not project or project["status"] == "completed" or project["is_archived"]:
+        raise ApiError(409, "The project is completed or archived.")
+    cleaned = _validated_project_changes(approver, project, req["payload"])
+    _apply_project_changes(approver, project, cleaned, {"approved_request": str(req["id"]),
+                                                        "requested_by": str(req["requested_by"])})
 
 
 def complete_project(viewer, project_id):
@@ -502,7 +661,7 @@ def add_member(viewer, project_id, body):
     audit(viewer, "project.member_add", "project", project["id"], project["name"],
           {"user_id": user_id, "user_name": _name(user_id), "hours_per_week": hours,
            "assigned_from": start, "assigned_to": end})
-    return get_project(viewer, project["id"]) | {"statusCode": 201}
+    return get_project(viewer, project["id"], status=201)
 
 
 def update_member(viewer, project_id, user_id, body):
@@ -568,6 +727,9 @@ def handler(event=None, context=None):
                 return create_project(viewer, body)
         elif parts == ["allocation"] and method == "GET":
             return allocation(viewer)
+        elif len(parts) == 3 and parts[0] == "approvals" and method == "POST" and parts[2] in ("approve", "reject", "cancel"):
+            req = decide_change_request(viewer, _uuid(parts[1]), parts[2], body, "project", apply_approved_project_change)
+            return response(200, {"request": req})
         elif len(parts) == 1:
             if method == "GET":
                 return get_project(viewer, parts[0])

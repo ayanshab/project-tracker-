@@ -1,8 +1,9 @@
-import { NavLink, Outlet } from 'react-router-dom'
+import { NavLink, Outlet, useLocation } from 'react-router-dom'
 import { useMediaQuery } from 'react-responsive'
 import { useAuth } from '../context/AuthContext'
 import { ROLE_LABEL } from '../utils/format'
-import { Avatar } from './ui'
+import { Avatar, useApi } from './ui'
+import { api } from '../services/api'
 
 const NAV = {
   admin: [
@@ -11,6 +12,7 @@ const NAV = {
     ['/people', 'People'],
     ['/allocation', 'Allocation'],
     ['/budgets', 'Budgets'],
+    ['/approvals', 'Approvals'],
     ['/archive', 'Archive'],
     ['/audit', 'Audit log'],
   ],
@@ -20,6 +22,7 @@ const NAV = {
     ['/people', 'My team'],
     ['/allocation', 'Allocation'],
     ['/budgets', 'Budgets'],
+    ['/approvals', 'Approvals'],
     ['/time', 'My time'],
   ],
   employee: [
@@ -48,10 +51,15 @@ export default function Layout() {
   const { user, logout } = useAuth()
   const isPhone = useMediaQuery({ maxWidth: 820 })
   const items = NAV[user.role] || NAV.employee
+  const { pathname } = useLocation()
+  // Admins see how many approvals are waiting for them; refreshed on every page change.
+  const inbox = useApi(() => (user.role === 'admin' ? api.get('/users/approvals', { status: 'pending' }) : Promise.resolve(null)), [pathname])
+  const waiting = inbox.data?.waiting_for_you || 0
 
   const links = items.map(([to, label]) => (
     <NavLink key={to} to={to} end={to === '/'} className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}>
       {label}
+      {to === '/approvals' && waiting > 0 && <span className="nav-badge" aria-label={`${waiting} waiting`}>{waiting}</span>}
     </NavLink>
   ))
 

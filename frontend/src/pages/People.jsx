@@ -3,7 +3,7 @@ import { api } from '../services/api'
 import { useAuth } from '../context/AuthContext'
 import {
   Avatar, Button, Empty, ErrorNote, Field, FormModal, Loading, Modal, PageHeader, Panel, Tag,
-  formToObject, useAction, useApi,
+  formToObject, useAction, useApi, useToast,
 } from '../components/ui'
 import { ROLE_LABEL, fmtMoney } from '../utils/format'
 
@@ -68,7 +68,7 @@ function AdminPeople() {
                       </div>
                     </td>
                     <td className="num">{u.employee_number}<div className="muted small">{u.username}</div></td>
-                    <td><Tag tone={ROLE_TONE[u.role]}>{ROLE_LABEL[u.role]}</Tag>{u.is_archived && <Tag>Archived</Tag>}{!u.is_archived && u.must_change_password && <Tag tone="warn" title="Has not replaced the temporary password yet">Awaiting first sign-in</Tag>}</td>
+                    <td><Tag tone={ROLE_TONE[u.role]}>{ROLE_LABEL[u.role]}</Tag>{u.is_archived && <Tag>Archived</Tag>}{!u.is_archived && u.must_change_password && <Tag tone="warn" title="Has not replaced the temporary password yet">Awaiting first sign-in</Tag>}{u.pending_change && <Tag tone="warn" title="A pay, manager, or role change is waiting for approval">Change pending</Tag>}</td>
                     <td>{u.manager_name || <span className="muted">None</span>}</td>
                     <td className="r num">{fmtMoney(u.pay_rate)}/h</td>
                     <td className="r nowrap">
@@ -102,12 +102,14 @@ function AdminPeople() {
 }
 
 function PersonForm({ person, managers, onClose, onSaved }) {
+  const toast = useToast()
   const submit = async (fd) => {
     const body = formToObject(fd, ['pay_rate'])
     if (!fd.get('manager_id')) body.manager_id = null
     if (person) {
       if (!fd.get('job_title')) body.job_title = ''
       const d = await api.patch(`/users/${person.id}`, body)
+      if (d.pending_approval) toast('Saved. The pay rate, manager, or role change was sent for approval.')
       onSaved(d)
     } else {
       onSaved(await api.post('/users', body))
@@ -132,6 +134,11 @@ function PersonForm({ person, managers, onClose, onSaved }) {
         </select>
       </Field>
       <Field label="Pay rate (USD per hour)" hint="Used to cost project time"><input name="pay_rate" type="number" min="0" step="0.01" defaultValue={person?.pay_rate ?? 0} /></Field>
+      {person && (
+        <Field label="Reason for pay, manager, or role change" wide hint="Needed only for those changes. Another admin must approve them before they apply.">
+          <input name="reason" maxLength={1000} placeholder="For example, annual compensation review" />
+        </Field>
+      )}
       {!person && <p className="muted small field-wide">A random username and a temporary password are created and shown once after you add the person.</p>}
     </FormModal>
   )

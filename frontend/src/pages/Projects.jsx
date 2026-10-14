@@ -72,8 +72,8 @@ export function ProjectForm({ project, onClose, onSaved }) {
     const body = formToObject(fd, ['budget_hours', 'planned_budget'])
     if (editing) {
       if (!fd.get('description')) body.description = ''
-      await api.patch(`/projects/${project.id}`, body)
-      toast('Project saved')
+      const d = await api.patch(`/projects/${project.id}`, body)
+      toast(d.pending_approval ? 'Saved. The budget or manager change was sent for approval.' : 'Project saved')
       onSaved?.()
       onClose()
     } else {
@@ -91,6 +91,11 @@ export function ProjectForm({ project, onClose, onSaved }) {
       <Field label="End date"><input name="end_date" type="date" required defaultValue={project?.end_date} /></Field>
       <Field label="Budgeted hours" hint="Total effort planned"><input name="budget_hours" type="number" min="0" step="1" defaultValue={project?.budget_hours ?? ''} /></Field>
       <Field label="Planned budget (USD)" hint="Labor plus other costs"><input name="planned_budget" type="number" min="0" step="100" defaultValue={project?.planned_budget ?? ''} /></Field>
+      {editing && (
+        <Field label="Reason for budget or manager change" wide hint="Needed only when you change the budget, budgeted hours, or project manager. A second admin approves those changes before they apply.">
+          <input name="reason" maxLength={1000} placeholder="For example, scope added for two new markets" />
+        </Field>
+      )}
       {user.role === 'admin' && (
         <Field label="Project manager" wide hint="Each project has exactly one manager.">
           {managers.loading ? <select disabled><option>Loading…</option></select> : (

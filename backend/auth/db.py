@@ -208,6 +208,28 @@ BEGIN
     END IF;
 END $$;
 
+-- Maker-checker: sensitive changes wait here until a different admin approves them.
+CREATE TABLE IF NOT EXISTS change_requests (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    kind             TEXT NOT NULL,
+    entity_type      TEXT NOT NULL CHECK (entity_type IN ('project', 'user')),
+    entity_id        UUID NOT NULL,
+    entity_name      TEXT,
+    payload          JSONB NOT NULL,
+    previous         JSONB NOT NULL DEFAULT '{}'::jsonb,
+    reason           TEXT,
+    status           TEXT NOT NULL DEFAULT 'pending'
+                     CHECK (status IN ('pending', 'approved', 'rejected', 'cancelled')),
+    requested_by     UUID NOT NULL REFERENCES users(id),
+    requested_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    decided_by       UUID REFERENCES users(id),
+    decided_at       TIMESTAMPTZ,
+    decision_note    TEXT,
+    CHECK (decided_by IS NULL OR decided_by <> requested_by)
+);
+CREATE INDEX IF NOT EXISTS change_requests_status_idx ON change_requests(status, requested_at DESC);
+CREATE INDEX IF NOT EXISTS change_requests_entity_idx ON change_requests(entity_type, entity_id);
+
 CREATE TABLE IF NOT EXISTS project_costs (
     id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     project_id       UUID NOT NULL REFERENCES projects(id),
@@ -227,7 +249,12 @@ def ensure_schema():
         return
     try:
         with get_conn().cursor() as cur:
-            cur.execute(SCHEMA)
+            # Several Lambdas can cold-start at once; serialize schema setup so they don't collide.
+            cur.execute("SELECT pg_advisory_lock(727272)")
+            try:
+                cur.execute(SCHEMA)
+            finally:
+                cur.execute("SELECT pg_advisory_unlock(727272)")
         _SCHEMA_READY = True
         logger.info("Schema verified")
     except Exception:

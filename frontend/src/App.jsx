@@ -14,6 +14,7 @@ import Archive from './pages/Archive'
 import Profile from './pages/Profile'
 import AuditLog from './pages/AuditLog'
 import SetPassword from './pages/SetPassword'
+import Approvals from './pages/Approvals'
 
 function RequireRole({ roles, children }) {
   const { user } = useAuth()
@@ -37,6 +38,7 @@ function AppRoutes() {
         <Route path="allocation" element={<RequireRole roles={['admin', 'manager']}><Allocation /></RequireRole>} />
         <Route path="budgets" element={<RequireRole roles={['admin', 'manager']}><Budgets /></RequireRole>} />
         <Route path="archive" element={<RequireRole roles={['admin']}><Archive /></RequireRole>} />
+        <Route path="approvals" element={<RequireRole roles={['admin', 'manager']}><Approvals /></RequireRole>} />
         <Route path="audit" element={<RequireRole roles={['admin']}><AuditLog /></RequireRole>} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>

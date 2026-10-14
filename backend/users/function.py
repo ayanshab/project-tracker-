@@ -11,6 +11,11 @@ Routes (all under /api/users, all require Authorization: Bearer <token>):
     POST   /{id}/archive         -> admin: archive a user
     POST   /{id}/unarchive       -> admin: restore a user
     POST   /{id}/reset-password  -> admin: issue a new temp password
+    GET    /approvals            -> change requests (admins: all; others: their own); query: status, mine
+    POST   /approvals/{id}/approve|reject|cancel -> decide a request (approve/reject: a different admin;
+                                    cancel: the requester). Project requests are approved via /api/projects.
+    PATCH changes to pay_rate, manager_id or role are not applied directly: they become a pending
+    request (a "reason" is required) until another admin approves them.
     GET    /audit                -> admin: audit log; query: q, action, entity_type, entity_id,
                                     actor_id, from, to (YYYY-MM-DD), limit, offset
 
@@ -35,6 +40,11 @@ from common import (
     ApiError,
     audit,
     changes,
+    decide_change_request,
+    list_change_requests,
+    pending_changes,
+    request_change,
+    split_sensitive,
     error,
     generate_password,
     generate_username,
@@ -187,7 +197,13 @@ def list_users(viewer, params):
     sql += " ORDER BY u.name LIMIT 500"
 
     rows = query(sql, args)
-    return response(200, {"users": [_shape(r, viewer) for r in rows]})
+    out = [_shape(r, viewer) for r in rows]
+    if viewer["role"] == "admin" and out:
+        waiting = {str(r["entity_id"]) for r in query(
+            "SELECT entity_id FROM change_requests WHERE entity_type = 'user' AND status = 'pending'")}
+        for u in out:
+            u["pending_change"] = str(u["id"]) in waiting
+    return response(200, {"users": out})
 
 
 def get_user(viewer, user_id):
@@ -196,7 +212,10 @@ def get_user(viewer, user_id):
         raise ApiError(404, "User not found")
     if target["is_archived"] and viewer["role"] != "admin":
         raise ApiError(404, "User not found")
-    return response(200, {"user": _shape(target, viewer)})
+    out = _shape(target, viewer)
+    if viewer["role"] == "admin":
+        out["pending_changes"] = pending_changes("user", target["id"])
+    return response(200, {"user": out})
 
 
 def create_user(viewer, body):
@@ -240,6 +259,55 @@ def create_user(viewer, body):
     })
 
 
+def _validated_user_changes(viewer, target, body, requested):
+    """Validate every requested field and return {column: clean value}. Applies nothing."""
+    user_id = str(target["id"])
+    is_self = user_id == str(viewer["id"])
+    out = {}
+    if "name" in requested:
+        out["name"] = _clean_name(body["name"])
+    if "email" in requested:
+        email = _clean_email(body["email"])
+        if query_one("SELECT 1 FROM users WHERE email = %s AND id <> %s", (email, user_id)):
+            raise ApiError(409, "A user with that email already exists")
+        out["email"] = email
+    if "job_title" in requested:
+        out["job_title"] = (body["job_title"] or "").strip() or None
+    if "pay_rate" in requested:
+        out["pay_rate"] = _clean_pay_rate(body["pay_rate"])
+    if "manager_id" in requested:
+        out["manager_id"] = _validate_manager(body["manager_id"], user_id)
+    if "role" in requested:
+        role = body["role"]
+        if role not in ROLES:
+            raise ApiError(400, f"role must be one of: {', '.join(ROLES)}")
+        if is_self and role != "admin":
+            raise ApiError(400, "You cannot remove your own admin role")
+        if target["role"] in ("manager", "admin") and role == "employee":
+            if query_one("SELECT 1 FROM projects WHERE manager_id = %s AND is_archived = FALSE", (user_id,)):
+                raise ApiError(409, "This user still manages active projects. Reassign them first.")
+            if query_one("SELECT 1 FROM users WHERE manager_id = %s AND is_archived = FALSE", (user_id,)):
+                raise ApiError(409, "This user still has direct reports. Reassign them first.")
+        out["role"] = role
+    return out
+
+
+def _apply_user_changes(viewer, target, values, audit_extra=None):
+    if not values:
+        return target
+    cols = list(values)
+    row = execute(
+        f"UPDATE users SET {', '.join(f'{c} = %s' for c in cols)}, updated_at = now() "
+        f"WHERE id = %s RETURNING {PUBLIC_USER_COLUMNS}",
+        [values[c] for c in cols] + [target["id"]],
+    )
+    diff = changes(target, row, cols)
+    if diff:
+        action = "user.reassign_manager" if "manager_id" in diff else "user.update"
+        audit(viewer, action, "user", target["id"], row["name"], {"changes": diff, **(audit_extra or {})})
+    return row
+
+
 def update_user(viewer, user_id, body):
     user_id = _check_uuid(user_id)
     target = _get_user(user_id)
@@ -269,44 +337,31 @@ def update_user(viewer, user_id, body):
     if not requested:
         raise ApiError(400, "No editable fields provided")
 
-    sets, args = [], []
-    if "name" in requested:
-        sets.append("name = %s"); args.append(_clean_name(body["name"]))
-    if "email" in requested:
-        email = _clean_email(body["email"])
-        if query_one("SELECT 1 FROM users WHERE email = %s AND id <> %s", (email, user_id)):
-            raise ApiError(409, "A user with that email already exists")
-        sets.append("email = %s"); args.append(email)
-    if "job_title" in requested:
-        sets.append("job_title = %s"); args.append((body["job_title"] or "").strip() or None)
-    if "pay_rate" in requested:
-        sets.append("pay_rate = %s"); args.append(_clean_pay_rate(body["pay_rate"]))
-    if "manager_id" in requested:
-        sets.append("manager_id = %s"); args.append(_validate_manager(body["manager_id"], user_id))
-    if "role" in requested:
-        role = body["role"]
-        if role not in ROLES:
-            raise ApiError(400, f"role must be one of: {', '.join(ROLES)}")
-        if is_self and role != "admin":
-            raise ApiError(400, "You cannot remove your own admin role")
-        if target["role"] in ("manager", "admin") and role == "employee":
-            if query_one("SELECT 1 FROM projects WHERE manager_id = %s AND is_archived = FALSE", (user_id,)):
-                raise ApiError(409, "This user still manages active projects. Reassign them first.")
-            if query_one("SELECT 1 FROM users WHERE manager_id = %s AND is_archived = FALSE", (user_id,)):
-                raise ApiError(409, "This user still has direct reports. Reassign them first.")
-        sets.append("role = %s"); args.append(role)
+    cleaned = _validated_user_changes(viewer, target, body, requested)
+    # Pay rate, manager and role changes need a second admin's approval (maker-checker).
+    now, later = split_sensitive("user", target, cleaned)
+    pending = request_change(viewer, "user", target, later, body.get("reason"))
+    row = _apply_user_changes(viewer, target, now)
+    return response(200, {"user": _shape(row, viewer), "pending_approval": pending})
 
-    sets.append("updated_at = now()")
-    args.append(user_id)
-    row = execute(
-        f"UPDATE users SET {', '.join(sets)} WHERE id = %s RETURNING {PUBLIC_USER_COLUMNS}",
-        args,
-    )
-    diff = changes(target, row, requested)
-    if diff:
-        action = "user.reassign_manager" if "manager_id" in diff else "user.update"
-        audit(viewer, action, "user", user_id, row["name"], {"changes": diff})
-    return response(200, {"user": _shape(row, viewer)})
+
+def apply_approved_user_change(approver, req):
+    target = _get_user(str(req["entity_id"]))
+    if not target or target["is_archived"]:
+        raise ApiError(409, "That person no longer exists or is archived.")
+    payload = req["payload"]
+    cleaned = _validated_user_changes(approver, target, payload, set(payload))
+    _apply_user_changes(approver, target, cleaned, {"approved_request": str(req["id"]),
+                                                    "requested_by": str(req["requested_by"])})
+
+
+def approvals(viewer, params):
+    return response(200, list_change_requests(viewer, params))
+
+
+def decide(viewer, request_id, action, body):
+    req = decide_change_request(viewer, _check_uuid(request_id), action, body, "user", apply_approved_user_change)
+    return response(200, {"request": req})
 
 
 def set_archived(viewer, user_id, archived):
@@ -405,12 +460,16 @@ def handler(event=None, context=None):
         elif len(parts) == 1:
             if parts[0] == "audit" and method == "GET":
                 return audit_log(viewer, params)
+            if parts[0] == "approvals" and method == "GET":
+                return approvals(viewer, params)
             if parts[0] == "me" and method == "GET":
                 return response(200, {"user": viewer})
             if method == "GET":
                 return get_user(viewer, parts[0])
             if method in ("PATCH", "PUT"):
                 return update_user(viewer, parts[0], body)
+        elif len(parts) == 3 and parts[0] == "approvals" and method == "POST" and parts[2] in ("approve", "reject", "cancel"):
+            return decide(viewer, parts[1], parts[2], body)
         elif len(parts) == 2 and method == "POST":
             if parts[1] == "archive":
                 return set_archived(viewer, parts[0], True)

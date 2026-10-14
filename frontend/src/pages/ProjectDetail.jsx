@@ -9,6 +9,8 @@ import {
 import MilestoneLine from '../components/MilestoneLine'
 import { RiskTags } from '../components/ProjectRow'
 import { ProjectForm } from './Projects'
+import Forecast from '../components/Forecast'
+import { ChangeList, decidePath } from './Approvals'
 import { BUDGET_STATUS, MILESTONE_STATUS, fmtDate, fmtHours, fmtMoney, fmtPct, fmtShort, todayISO } from '../utils/format'
 
 export default function ProjectDetail() {
@@ -67,17 +69,49 @@ export default function ProjectDetail() {
       </div>
 
       <div className="tabs" role="tablist">
-        {[['milestones', 'Milestones'], ['team', 'Team'], ...(p.can_manage ? [['budget', 'Budget']] : [])].map(([k, label]) => (
+        {[['milestones', 'Milestones'], ['team', 'Team'], ['forecast', 'Forecast'], ...(p.can_manage ? [['budget', 'Budget']] : [])].map(([k, label]) => (
           <button key={k} role="tab" aria-selected={tab === k} className={`tab ${tab === k ? 'active' : ''}`} onClick={() => setTab(k)}>{label}</button>
         ))}
       </div>
 
+      {p.can_manage && p.pending_changes?.length > 0 && <PendingChanges projectId={p.id} onChanged={reload} />}
+
+      {tab === 'forecast' && <Forecast project={p} />}
       {tab === 'milestones' && <Milestones project={p} milestones={milestones} manage={manage} reload={reload} />}
       {tab === 'team' && <Team project={p} manage={manage} reload={reload} />}
       {tab === 'budget' && p.can_manage && <Budget project={p} manage={manage} />}
 
       {editing && <ProjectForm project={p} onClose={() => setEditing(false)} onSaved={reload} />}
     </>
+  )
+}
+
+// ---------- Pending approvals ----------
+
+function PendingChanges({ projectId, onChanged }) {
+  const { user } = useAuth()
+  const act = useAction()
+  const { data, reload } = useApi(() => api.get('/users/approvals', { entity_id: projectId, status: 'pending' }), [projectId])
+  const rows = data?.requests || []
+  if (!rows.length) return null
+  const run = (r, action, msg) => act(() => api.post(decidePath(r, action), {}), msg).then(() => { reload(); onChanged() })
+  return (
+    <div className="pending-banner" role="status">
+      {rows.map((r) => (
+        <div key={r.id} className="pending-row">
+          <div>
+            <strong>Waiting for approval.</strong>{' '}
+            <span className="muted">Requested by {String(r.requested_by) === String(user.id) ? 'you' : r.requested_by_name}: "{r.reason}"</span>
+            <ChangeList changes={r.changes} />
+          </div>
+          <div className="pending-actions">
+            {r.can_decide && <Button size="sm" onClick={() => run(r, 'approve', 'Change approved and applied')}>Approve</Button>}
+            {r.can_decide && <Link className="btn btn-sm btn-ghost" to="/approvals">Review</Link>}
+            {r.can_cancel && <Button size="sm" variant="ghost" onClick={() => run(r, 'cancel', 'Request cancelled')}>Cancel request</Button>}
+          </div>
+        </div>
+      ))}
+    </div>
   )
 }
 

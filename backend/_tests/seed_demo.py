@@ -6,8 +6,9 @@ Usage (from the repo root):
     python3 backend/_tests/seed_demo.py                 # seeds the main local database
     POSTGRES_NAME=test_db python3 backend/_tests/seed_demo.py
 
-Creates managers, employees, three projects with milestones, tasks, team
-assignments, logged time, and other costs. Every demo account gets the password
+Creates managers, employees, a second admin (approvals need two people),
+projects with milestones, tasks, team assignments, logged time, other costs,
+and one budget increase waiting for approval. Every demo account gets the password
 Demo123! and the script prints the generated usernames.
 Safe to run once per database; it stops if the demo data already exists.
 """
@@ -183,6 +184,10 @@ assign(maria, done, cara, 4, day(-120))
 w1 = milestone(maria, done, "Install and verify", "Survey, install, and sign off coverage.", day(-120), day(-30))
 ms_action(maria, w1, "start"); ms_action(maria, w1, "complete")
 call(projects, "POST", f"/api/projects/{done['id']}/complete", None, maria["token"])
+
+# 5. Maker-checker: a second admin to approve changes, and one budget increase waiting for review
+priya = person("Priya Raman", "admin", "Compliance Officer", 90)
+call(projects, "PATCH", f"/api/projects/{dw['id']}", {"planned_budget": 85000, "reason": "Consultant extended six weeks to finish the sales pipeline"}, dev["token"])
 
 print("Demo data created. Every account below uses the password", DEMO_PASSWORD)
 print(f"{'Name':<18} {'Role':<9} Username")

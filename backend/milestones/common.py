@@ -16,7 +16,7 @@ import time
 from datetime import date, datetime
 from decimal import Decimal
 
-from db import execute, query_one
+from db import execute, query, query_one
 
 logger = logging.getLogger()
 
@@ -265,6 +265,175 @@ def audit(actor, action, entity_type, entity_id=None, entity_name=None, details=
         )
     except Exception:  # noqa: BLE001 - auditing must never hide the result of the action itself
         logger.exception("Failed to write audit log entry for %s", action)
+
+
+# ---------- Maker-checker approvals ----------
+
+# Fields whose changes must be approved by a second person (an admin other than the requester).
+SENSITIVE_FIELDS = {
+    "project": {"planned_budget": "budget", "budget_hours": "hour budget", "manager_id": "project manager"},
+    "user": {"pay_rate": "pay rate", "manager_id": "manager", "role": "role"},
+}
+
+
+def pending_changes(entity_type, entity_id):
+    return query(
+        "SELECT * FROM change_requests WHERE entity_type = %s AND entity_id = %s AND status = 'pending' "
+        "ORDER BY requested_at",
+        (entity_type, entity_id),
+    )
+
+
+def request_change(viewer, entity_type, entity, proposed, reason):
+    """Record a pending change instead of applying it. `proposed` holds only fields that really change."""
+    if not proposed:
+        return None
+    labels = SENSITIVE_FIELDS[entity_type]
+    reason = (reason or "").strip()
+    if len(reason) < 5:
+        what = " and ".join(labels[k] for k in proposed)
+        raise ApiError(400, f"Add a reason for the {what} change. It goes to the approving admin.")
+    for p in pending_changes(entity_type, entity["id"]):
+        overlap = set(p["payload"]) & set(proposed)
+        if overlap:
+            raise ApiError(409, f"A {' and '.join(labels[k] for k in overlap)} change is already waiting for "
+                                "approval. Cancel it or wait for a decision first.")
+    previous = {k: entity.get(k) for k in proposed}
+    row = execute(
+        """
+        INSERT INTO change_requests (kind, entity_type, entity_id, entity_name, payload, previous, reason, requested_by)
+        VALUES (%s, %s, %s, %s, %s::jsonb, %s::jsonb, %s, %s) RETURNING *
+        """,
+        (
+            f"{entity_type}.{'+'.join(sorted(proposed))}", entity_type, entity["id"], entity.get("name"),
+            json.dumps(proposed, default=_json_default), json.dumps(previous, default=_json_default),
+            reason[:1000], viewer["id"],
+        ),
+    )
+    audit(viewer, "approval.request", entity_type, entity["id"], entity.get("name"), {
+        "request_id": row["id"], "reason": reason[:1000],
+        "changes": {k: [previous[k], v] for k, v in proposed.items()},
+    })
+    return row
+
+
+def _same(a, b):
+    try:
+        return float(a) == float(b)
+    except (TypeError, ValueError):
+        return str(a if a is not None else "") == str(b if b is not None else "")
+
+
+def split_sensitive(entity_type, current, cleaned):
+    """Split validated new values into (apply_now, needs_approval), dropping values that don't change."""
+    now, later = {}, {}
+    for k, v in cleaned.items():
+        if k in SENSITIVE_FIELDS[entity_type]:
+            if not _same(current.get(k), v):
+                later[k] = v
+        else:
+            now[k] = v
+    return now, later
+
+
+def list_change_requests(viewer, params):
+    """Admins see everything; everyone else sees the requests they made."""
+    where, args = [], []
+    if viewer["role"] != "admin" or str(params.get("mine", "")).lower() == "true":
+        where.append("r.requested_by = %s"); args.append(viewer["id"])
+    if params.get("status") in ("pending", "approved", "rejected", "cancelled"):
+        where.append("r.status = %s"); args.append(params["status"])
+    if params.get("entity_id"):
+        where.append("r.entity_id = %s"); args.append(params["entity_id"])
+    rows = query(
+        f"""
+        SELECT r.*, rq.name AS requested_by_name, rq.role AS requested_by_role, dc.name AS decided_by_name
+        FROM change_requests r
+        JOIN users rq ON rq.id = r.requested_by
+        LEFT JOIN users dc ON dc.id = r.decided_by
+        {"WHERE " + " AND ".join(where) if where else ""}
+        ORDER BY (r.status = 'pending') DESC, r.requested_at DESC
+        LIMIT 200
+        """,
+        args,
+    )
+    # Show people's names instead of IDs for manager changes.
+    ids = {str(v) for r in rows for side in (r["payload"], r["previous"]) for k, v in side.items()
+           if k == "manager_id" and v}
+    names = {}
+    if ids:
+        names = {str(u["id"]): u["name"] for u in query("SELECT id, name FROM users WHERE id = ANY(%s::uuid[])", (list(ids),))}
+    for r in rows:
+        r["changes"] = [
+            {"field": k, "label": SENSITIVE_FIELDS[r["entity_type"]].get(k, k),
+             "from": names.get(str(r["previous"].get(k)), r["previous"].get(k)) if k == "manager_id" else r["previous"].get(k),
+             "to": names.get(str(v), v) if k == "manager_id" else v}
+            for k, v in r["payload"].items()
+        ]
+        r["can_decide"] = viewer["role"] == "admin" and r["status"] == "pending" and str(r["requested_by"]) != str(viewer["id"])
+        r["can_cancel"] = r["status"] == "pending" and str(r["requested_by"]) == str(viewer["id"])
+    pending_for_me = 0
+    if viewer["role"] == "admin":
+        pending_for_me = query_one(
+            "SELECT COUNT(*) AS n FROM change_requests WHERE status = 'pending' AND requested_by <> %s", (viewer["id"],)
+        )["n"]
+    return {"requests": rows, "waiting_for_you": pending_for_me}
+
+
+def decide_change_request(viewer, request_id, action, body, entity_type, apply_fn):
+    """approve / reject / cancel a request. apply_fn(approver, request) performs an approved change."""
+    req = query_one("SELECT * FROM change_requests WHERE id = %s", (request_id,))
+    if not req:
+        raise ApiError(404, "Request not found")
+    if req["status"] != "pending":
+        raise ApiError(409, f"This request was already {req['status']}")
+    note = (body.get("note") or "").strip()[:1000] or None
+
+    if action == "cancel":
+        if str(req["requested_by"]) != str(viewer["id"]):
+            raise ApiError(403, "Only the person who asked for this change can cancel it")
+        execute("UPDATE change_requests SET status = 'cancelled', decided_at = now() WHERE id = %s AND status = 'pending'",
+                (req["id"],))
+        audit(viewer, "approval.cancel", req["entity_type"], req["entity_id"], req["entity_name"], {"request_id": req["id"]})
+        return query_one("SELECT * FROM change_requests WHERE id = %s", (req["id"],))
+
+    if viewer["role"] != "admin":
+        raise ApiError(403, "Only an admin can approve or reject changes")
+    if str(req["requested_by"]) == str(viewer["id"]):
+        raise ApiError(403, "You cannot approve or reject your own request. Another admin has to review it.")
+
+    if action == "reject":
+        if not note:
+            raise ApiError(400, "Add a note explaining why the change is rejected")
+        execute(
+            "UPDATE change_requests SET status = 'rejected', decided_by = %s, decided_at = now(), decision_note = %s "
+            "WHERE id = %s AND status = 'pending'",
+            (viewer["id"], note, req["id"]),
+        )
+        audit(viewer, "approval.reject", req["entity_type"], req["entity_id"], req["entity_name"],
+              {"request_id": req["id"], "note": note})
+        return query_one("SELECT * FROM change_requests WHERE id = %s", (req["id"],))
+
+    if req["entity_type"] != entity_type:
+        raise ApiError(400, f"Approve {req['entity_type']} changes through the {req['entity_type']}s service")
+    claimed = execute(
+        "UPDATE change_requests SET status = 'approved', decided_by = %s, decided_at = now(), decision_note = %s "
+        "WHERE id = %s AND status = 'pending' RETURNING *",
+        (viewer["id"], note, req["id"]),
+    )
+    if not claimed or isinstance(claimed, int):
+        raise ApiError(409, "Another admin decided this request first")
+    try:
+        apply_fn(viewer, claimed)
+    except ApiError as e:
+        execute("UPDATE change_requests SET status = 'pending', decided_by = NULL, decided_at = NULL, "
+                "decision_note = NULL WHERE id = %s", (req["id"],))
+        raise ApiError(409, f"The change can no longer be applied: {e.message} Reject it instead.")
+    audit(viewer, "approval.approve", req["entity_type"], req["entity_id"], req["entity_name"], {
+        "request_id": req["id"], "requested_by": str(req["requested_by"]), "note": note,
+        "changes": {k: [req["previous"].get(k), v] for k, v in req["payload"].items()},
+    })
+    return query_one("SELECT * FROM change_requests WHERE id = %s", (req["id"],))
 
 
 def changes(before, body, fields):

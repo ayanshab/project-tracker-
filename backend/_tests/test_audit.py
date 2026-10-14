@@ -35,6 +35,17 @@ def first_login(username, temp_password, ip=None):
     token = call(auth, "POST", "/api/auth/login", {"username": username, "password": temp_password}, **({"ip": ip} if ip else {}))[1]["token"]
     call(auth, "POST", "/api/auth/change-password", {"current_password": temp_password, "new_password": "Passw0rd!"}, token)
     return token
+proj_mod = proj
+
+# A second admin, because sensitive changes need someone other than the requester to approve them.
+_a2 = call(users, "POST", "/api/users", {"name": "Second Admin", "email": f"admin2@{tag}.test", "role": "admin"}, A)[1]
+A2 = first_login(_a2["user"]["username"], _a2["temporary_password"])
+def approved(res, approver_token):
+    """res = (status, body) of a PATCH that created a pending change. Approves it and returns the approval."""
+    assert res[0] == 200 and res[1].get("pending_approval"), res
+    req = res[1]["pending_approval"]
+    svc = users if req["entity_type"] == "user" else proj_mod
+    return call(svc, "POST", f"/api/{req['entity_type']}s/approvals/{req['id']}/approve", {}, approver_token)
 M = first_login(mgr["user"]["username"], mgr["temporary_password"], ip="203.0.113.7")
 E = first_login(emp["user"]["username"], emp["temporary_password"])
 
@@ -43,16 +54,16 @@ check("manager cannot read audit log", call(users, "GET", "/api/users/audit", No
 check("failed login", call(auth, "POST", "/api/auth/login", {"username": emp["user"]["username"], "password": "wrong-password"}), 401)
 assert log(A, action="auth.password_change", entity_id=emp["user"]["id"]); print("PASS first password change logged")
 e = log(A, q=tag, action="user.create")
-assert len(e) == 2 and e[0]["actor_name"] == "System Administrator"; print("PASS user.create logged by admin, details:", e[0]["details"]["role"])
+assert len(e) == 3 and all(x["actor_name"] == "System Administrator" for x in e); print("PASS user.create logged by admin, details:", e[0]["details"]["role"])
 fail = log(A, action="auth.login_failed", entity_id=emp["user"]["id"])[0]
 assert "wrong-password" not in json.dumps(fail); print("PASS failed login logged without the password:", fail["details"])
 mlogin = log(A, action="auth.login", entity_id=mgr["user"]["id"])[0]
 assert mlogin["source_ip"] == "203.0.113.7" and mlogin["user_agent"] == "audit-test"; print("PASS login records IP and browser:", mlogin["source_ip"])
 
-check("pay rate change", call(users, "PATCH", f"/api/users/{emp['user']['id']}", {"pay_rate": 45}, A), 200)
+check("pay rate change approved", approved(call(users, "PATCH", f"/api/users/{emp['user']['id']}", {"pay_rate": 45, "reason": "Annual review"}, A), A2), 200)
 ch = log(A, action="user.update", entity_id=emp["user"]["id"])[0]["details"]["changes"]
 assert ch["pay_rate"] == [40.0, 45.0]; print("PASS update stores before and after:", ch)
-check("no-op update", call(users, "PATCH", f"/api/users/{emp['user']['id']}", {"pay_rate": 45}, A), 200)
+_noop = call(users, "PATCH", f"/api/users/{emp['user']['id']}", {"pay_rate": 45}, A); check("no-op update", _noop, 200); assert _noop[1]["pending_approval"] is None
 assert len(log(A, action="user.update", entity_id=emp["user"]["id"])) == 1; print("PASS unchanged save adds no entry")
 
 p = call(proj, "POST", "/api/projects", {"name": f"Audit P {tag}", "start_date": "2026-01-01", "end_date": "2026-12-31", "planned_budget": 1000}, M)[1]["project"]
@@ -68,13 +79,13 @@ call(bud, "POST", "/api/budgets/costs", {"project_id": p["id"], "category": "sof
 call(mil, "POST", f"/api/milestones/{ms['id']}/complete", None, M)
 call(proj, "POST", f"/api/projects/{p['id']}/complete", None, M)
 call(proj, "POST", f"/api/projects/{p['id']}/unarchive", None, A)
-call(users, "PATCH", f"/api/users/{emp['user']['id']}", {"manager_id": None}, A)
+approved(call(users, "PATCH", f"/api/users/{emp['user']['id']}", {"manager_id": None, "reason": "Leaving team"}, A), A2)
 
 trail = [x["action"] for x in reversed(log(A, q=tag, limit=100)) if x["action"] not in ("auth.login",)]
 print("    trail:", trail)
 for a in ("project.create", "project.member_add", "project.update", "milestone.create", "milestone.member_add",
           "task.create", "milestone.start", "task.complete", "time.log", "cost.add", "milestone.complete",
-          "project.complete", "project.unarchive", "user.reassign_manager"):
+          "project.complete", "project.unarchive", "user.reassign_manager", "approval.request", "approval.approve"):
     assert a in trail, a
 print("PASS every kind of change is in the trail")
 tc = log(A, action="task.complete")[0]
