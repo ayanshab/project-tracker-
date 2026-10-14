@@ -55,6 +55,9 @@ d = check("add unassigned task", call(mil, "POST", f"{P}/{m1['id']}/tasks", {"ti
 t_ann = next(t for t in d["tasks"] if t["title"] == "Wireframes"); t_open = next(t for t in d["tasks"] if t["title"] == "Style guide")
 check("cannot check off before milestone starts", call(mil, "PATCH", f"{P}/tasks/{t_ann['id']}", {"completed": True}, E1), 409)
 check("start M1", call(mil, "POST", f"{P}/{m1['id']}/start", None, M), 200)
+mine = check("Ann's open milestones", call(mil, "GET", f"{P}/mine", None, E1), 200)
+print("    Ann sees:", [(x["name"], [t["title"] for t in x["tasks"]]) for x in mine["milestones"]])
+assert len(mine["milestones"]) == 1 and len(mine["milestones"][0]["tasks"]) == 2
 check("Ben cannot check off Ann's task", call(mil, "PATCH", f"{P}/tasks/{t_ann['id']}", {"completed": True}, E2), 403)
 check("Ann checks off her task", call(mil, "PATCH", f"{P}/tasks/{t_ann['id']}", {"completed": True}, E1), 200)
 check("employee cannot rename task", call(mil, "PATCH", f"{P}/tasks/{t_ann['id']}", {"title": "x"}, E1), 403)
@@ -63,6 +66,8 @@ check("complete blocked by open task", call(mil, "POST", f"{P}/{m1['id']}/comple
 check("Ben checks off unassigned task", call(mil, "PATCH", f"{P}/tasks/{t_open['id']}", {"completed": True}, E2), 200)
 d = check("manager completes M1", call(mil, "POST", f"{P}/{m1['id']}/complete", None, M), 200)["milestone"]
 print("    M1 progress:", d["progress_pct"], "%")
+mine = check("Ann's open milestones (none after M1 completes)", call(mil, "GET", f"{P}/mine", None, E1), 200)
+assert mine["milestones"] == []
 check("Ann can now join M2", call(mil, "POST", f"{P}/{m2['id']}/members", {"user_id": e1["user"]["id"]}, M), 201)
 check("start M2", call(mil, "POST", f"{P}/{m2['id']}/start", None, M), 200)
 check("cannot reopen M1 once M2 started", call(mil, "POST", f"{P}/{m1['id']}/reopen", None, M), 409)

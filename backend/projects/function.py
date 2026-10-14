@@ -285,6 +285,19 @@ def list_projects(viewer, params):
 
     rows = query(f"{STATS_SQL} WHERE {' AND '.join(where)} ORDER BY p.end_date, p.name", args)
     projects = [_health(r) for r in rows]
+    if projects:
+        today = date.today()
+        stops = query(
+            "SELECT id, project_id, position, name, status, start_date, end_date FROM milestones "
+            "WHERE project_id = ANY(%s) ORDER BY project_id, position",
+            ([p["id"] for p in projects],),
+        )
+        by_project = {}
+        for s in stops:
+            s["overdue"] = s["status"] != "completed" and today > s["end_date"]
+            by_project.setdefault(s["project_id"], []).append(s)
+        for p in projects:
+            p["milestones"] = by_project.get(p["id"], [])
     if str(params.get("at_risk", "")).lower() == "true":
         projects = [p for p in projects if p["at_risk"]]
     return response(200, {"projects": projects})

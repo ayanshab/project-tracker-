@@ -1,0 +1,106 @@
+import { useState } from 'react'
+import { useNavigate, useSearchParams } from 'react-router-dom'
+import { api } from '../services/api'
+import { useAuth } from '../context/AuthContext'
+import { Button, Empty, ErrorNote, Field, FormModal, Loading, PageHeader, formToObject, useApi, useToast } from '../components/ui'
+import ProjectRow from '../components/ProjectRow'
+import { todayISO } from '../utils/format'
+
+export default function Projects() {
+  const { user } = useAuth()
+  const [params, setParams] = useSearchParams()
+  const [q, setQ] = useState(params.get('q') || '')
+  const atRisk = params.get('at_risk') === 'true'
+  const creating = params.get('new') === '1'
+  const canCreate = user.role !== 'employee'
+
+  const { data, error, loading, reload } = useApi(
+    () => api.get('/projects', { q: params.get('q'), at_risk: atRisk ? 'true' : undefined }),
+    [params.get('q'), atRisk],
+  )
+
+  const setParam = (k, v) => {
+    const next = new URLSearchParams(params)
+    if (v) next.set(k, v)
+    else next.delete(k)
+    setParams(next, { replace: true })
+  }
+
+  return (
+    <>
+      <PageHeader
+        title="Projects"
+        subtitle={user.role === 'employee' ? 'Projects you are assigned to.' : user.role === 'admin' ? 'All active projects.' : 'Projects you manage or work on.'}
+        actions={canCreate && <Button onClick={() => setParam('new', '1')}>New project</Button>}
+      />
+      <form className="toolbar" onSubmit={(e) => { e.preventDefault(); setParam('q', q.trim()) }} role="search">
+        <input type="search" placeholder="Search by project or manager" value={q} onChange={(e) => setQ(e.target.value)} aria-label="Search projects" />
+        <Button type="submit" variant="ghost">Search</Button>
+        <label className="check">
+          <input type="checkbox" checked={atRisk} onChange={(e) => setParam('at_risk', e.target.checked ? 'true' : '')} />
+          Only projects that need attention
+        </label>
+      </form>
+
+      {loading ? <Loading /> : error ? <ErrorNote error={error} onRetry={reload} /> : data.projects.length ? (
+        <div className="plist">{data.projects.map((p) => <ProjectRow key={p.id} project={p} showBudget={user.role !== 'employee'} />)}</div>
+      ) : (
+        <Empty
+          title={params.get('q') || atRisk ? 'No projects match' : 'No projects yet'}
+          action={canCreate && !params.get('q') && !atRisk && <Button onClick={() => setParam('new', '1')}>Create the first project</Button>}
+        >
+          {params.get('q') || atRisk ? 'Try a different search or clear the filter.' : user.role === 'employee' ? 'Your manager will add you to a project team.' : ''}
+        </Empty>
+      )}
+
+      {creating && <ProjectForm onClose={() => setParam('new', '')} />}
+    </>
+  )
+}
+
+export function ProjectForm({ project, onClose, onSaved }) {
+  const { user } = useAuth()
+  const toast = useToast()
+  const navigate = useNavigate()
+  const editing = Boolean(project)
+  const managers = useApi(
+    () => (user.role === 'admin' ? api.get('/users').then((d) => d.users.filter((u) => u.role !== 'employee')) : Promise.resolve([])),
+    [],
+  )
+
+  const submit = async (fd) => {
+    const body = formToObject(fd, ['budget_hours', 'planned_budget'])
+    if (editing) {
+      if (!fd.get('description')) body.description = ''
+      await api.patch(`/projects/${project.id}`, body)
+      toast('Project saved')
+      onSaved?.()
+      onClose()
+    } else {
+      const d = await api.post('/projects', body)
+      toast('Project created')
+      navigate(`/projects/${d.project.id}`)
+    }
+  }
+
+  return (
+    <FormModal title={editing ? 'Edit project' : 'New project'} submitLabel={editing ? 'Save project' : 'Create project'} onSubmit={submit} onClose={onClose}>
+      <Field label="Name" wide><input name="name" required maxLength={200} defaultValue={project?.name} /></Field>
+      <Field label="Description" wide><textarea name="description" rows={3} maxLength={2000} defaultValue={project?.description || ''} /></Field>
+      <Field label="Start date"><input name="start_date" type="date" required defaultValue={project?.start_date || todayISO()} /></Field>
+      <Field label="End date"><input name="end_date" type="date" required defaultValue={project?.end_date} /></Field>
+      <Field label="Budgeted hours" hint="Total effort planned"><input name="budget_hours" type="number" min="0" step="1" defaultValue={project?.budget_hours ?? ''} /></Field>
+      <Field label="Planned budget (USD)" hint="Labor plus other costs"><input name="planned_budget" type="number" min="0" step="100" defaultValue={project?.planned_budget ?? ''} /></Field>
+      {user.role === 'admin' && (
+        <Field label="Project manager" wide hint="Each project has exactly one manager.">
+          {managers.loading ? <select disabled><option>Loading…</option></select> : (
+            <select name="manager_id" required defaultValue={project?.manager_id || ''}>
+              <option value="" disabled>Choose a manager</option>
+              {(managers.data || []).map((m) => <option key={m.id} value={m.id}>{m.name} ({m.job_title || m.role})</option>)}
+            </select>
+          )}
+        </Field>
+      )}
+    </FormModal>
+  )
+}

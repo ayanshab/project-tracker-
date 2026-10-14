@@ -4,6 +4,7 @@ the tasks employees check off.
 
 Routes (all under /api/milestones, all require Authorization: Bearer <token>):
     GET    /?project_id=...              -> milestones of a project, in order, with progress
+    GET    /mine                         -> caller's open milestones with their tasks (dashboard)
     GET    /{id}                         -> one milestone with members and tasks
     POST   /                             -> create {project_id, name, start_date, end_date, description?}
     PATCH  /{id}                         -> edit name, description, dates
@@ -186,6 +187,34 @@ def _detail(viewer, ms_id):
 
 
 # ---------- Milestone handlers ----------
+
+def my_milestones(viewer):
+    """Open milestones the caller is assigned to, with their tasks, across active projects."""
+    rows = query(
+        f"""{LIST_SQL}
+        JOIN milestone_members me ON me.milestone_id = m.id AND me.user_id = %s
+        JOIN projects p ON p.id = m.project_id
+        WHERE m.status <> 'completed' AND p.is_archived = FALSE AND p.status = 'active'
+        ORDER BY m.end_date""",
+        (viewer["id"],),
+    )
+    out = []
+    for r in rows:
+        item = dict(r)
+        project = query_one("SELECT name FROM projects WHERE id = %s", (r["project_id"],))
+        item["project_name"] = project["name"]
+        item["tasks"] = query(
+            """
+            SELECT t.id, t.title, t.assigned_to, u.name AS assigned_to_name, t.completed
+            FROM tasks t LEFT JOIN users u ON u.id = t.assigned_to
+            WHERE t.milestone_id = %s AND (t.assigned_to = %s OR t.assigned_to IS NULL)
+            ORDER BY t.completed, t.created_at
+            """,
+            (r["id"], viewer["id"]),
+        )
+        out.append(item)
+    return response(200, {"milestones": out})
+
 
 def list_milestones(viewer, params):
     project, can_manage = _project_access(viewer, params.get("project_id"))
@@ -441,6 +470,8 @@ def handler(event=None, context=None):
                 return list_milestones(viewer, params)
             if method == "POST":
                 return create_milestone(viewer, body)
+        elif parts == ["mine"] and method == "GET":
+            return my_milestones(viewer)
         elif parts[0] == "tasks" and len(parts) == 2:
             if method in ("PATCH", "PUT"):
                 return update_task(viewer, parts[1], body)
