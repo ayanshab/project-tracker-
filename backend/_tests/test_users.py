@@ -14,6 +14,8 @@ for k, v in {"POSTGRES_HOST": "localhost", "POSTGRES_PORT": "5432", "POSTGRES_US
              "POSTGRES_PASS": "postgres123", "POSTGRES_NAME": "postgres"}.items():
     os.environ.setdefault(k, v)
 sys.path.insert(0, os.path.join(BACKEND, "auth"))
+import uuid
+TAG = uuid.uuid4().hex[:8]  # unique emails so the suite can run repeatedly
 def load(name, path):
     spec = importlib.util.spec_from_file_location(name, path); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m); return m
 auth = load("auth_fn", os.path.join(BACKEND, "auth", "function.py"))
@@ -28,13 +30,13 @@ def check(label, got, want):
 s, b = call(auth, "POST", "/api/auth/login", {"username": "admin", "password": "Admin123!"}); assert s == 200
 A = b["token"]; admin_id = b["user"]["id"]
 check("no token", call(users, "GET", "/api/users"), 401)
-s, m = call(users, "POST", "/api/users", {"name": "Maria Manager", "email": "maria@acme.com", "role": "manager", "job_title": "PM", "pay_rate": 60}, A); check("create manager", (s, m), 201)
-s, e1 = call(users, "POST", "/api/users", {"name": "Eli One", "email": "eli@acme.com", "role": "employee", "manager_id": m["user"]["id"], "pay_rate": 40}, A); check("create emp1", (s, e1), 201)
-s, e2 = call(users, "POST", "/api/users", {"name": "Eve Two", "email": "eve@acme.com", "role": "employee", "manager_id": m["user"]["id"], "pay_rate": 42}, A); check("create emp2", (s, e2), 201)
-s, o = call(users, "POST", "/api/users", {"name": "Other Mgr", "email": "om@acme.com", "role": "manager"}, A); check("create mgr2", (s, o), 201)
-s, x = call(users, "POST", "/api/users", {"name": "Xavier", "email": "x@acme.com", "role": "employee", "manager_id": o["user"]["id"]}, A); check("create other-team emp", (s, x), 201)
-check("dup email", call(users, "POST", "/api/users", {"name": "Dup", "email": "ELI@acme.com", "role": "employee"}, A), 409)
-check("employee as manager rejected", call(users, "POST", "/api/users", {"name": "Bad", "email": "bad@acme.com", "role": "employee", "manager_id": e1["user"]["id"]}, A), 400)
+s, m = call(users, "POST", "/api/users", {"name": "Maria Manager", "email": f"maria@{TAG}.test", "role": "manager", "job_title": "PM", "pay_rate": 60}, A); check("create manager", (s, m), 201)
+s, e1 = call(users, "POST", "/api/users", {"name": "Eli One", "email": f"eli@{TAG}.test", "role": "employee", "manager_id": m["user"]["id"], "pay_rate": 40}, A); check("create emp1", (s, e1), 201)
+s, e2 = call(users, "POST", "/api/users", {"name": "Eve Two", "email": f"eve@{TAG}.test", "role": "employee", "manager_id": m["user"]["id"], "pay_rate": 42}, A); check("create emp2", (s, e2), 201)
+s, o = call(users, "POST", "/api/users", {"name": "Other Mgr", "email": f"om@{TAG}.test", "role": "manager"}, A); check("create mgr2", (s, o), 201)
+s, x = call(users, "POST", "/api/users", {"name": "Xavier", "email": f"x@{TAG}.test", "role": "employee", "manager_id": o["user"]["id"]}, A); check("create other-team emp", (s, x), 201)
+check("dup email", call(users, "POST", "/api/users", {"name": "Dup", "email": f"ELI@{TAG}.test", "role": "employee"}, A), 409)
+check("employee as manager rejected", call(users, "POST", "/api/users", {"name": "Bad", "email": f"bad@{TAG}.test", "role": "employee", "manager_id": e1["user"]["id"]}, A), 400)
 print("  username sample:", e1["user"]["username"], "emp#", e1["user"]["employee_number"])
 lg = lambda u, p: call(auth, "POST", "/api/auth/login", {"username": u, "password": p})[1]["token"]
 M = lg(m["user"]["username"], m["temporary_password"]); E = lg(e1["user"]["username"], e1["temporary_password"])
@@ -42,7 +44,7 @@ s, b = call(users, "GET", "/api/users", None, E); names = sorted(u["name"] for u
 print("  employee sees:", names, "| pay visible on teammate:", any("pay_rate" in u for u in b["users"] if u["name"] == "Eve Two")); assert names == ["Eli One", "Eve Two", "Maria Manager"]
 s, b = call(users, "GET", "/api/users", None, M); print("  manager sees:", sorted(u["name"] for u in b["users"]))
 check("employee cannot view other team", call(users, "GET", f"/api/users/{x['user']['id']}", None, E), 404)
-check("employee edits own email", call(users, "PATCH", f"/api/users/{e1['user']['id']}", {"email": "eli.one@acme.com"}, E), 200)
+check("employee edits own email", call(users, "PATCH", f"/api/users/{e1['user']['id']}", {"email": f"eli.one@{TAG}.test"}, E), 200)
 check("employee cannot edit teammate", call(users, "PATCH", f"/api/users/{e2['user']['id']}", {"name": "Hacked"}, E), 403)
 check("employee cannot change own title", call(users, "PATCH", f"/api/users/{e1['user']['id']}", {"job_title": "CEO"}, E), 403)
 check("manager edits report name", call(users, "PATCH", f"/api/users/{e2['user']['id']}", {"name": "Eve Second"}, M), 200)
@@ -56,7 +58,7 @@ s, b = call(auth, "POST", "/api/auth/login", {"username": x["user"]["username"],
 check("search", call(users, "GET", "/api/users", None, A, {"q": "eve"}), 200)
 check("unarchive", call(users, "POST", f"/api/users/{x['user']['id']}/unarchive", None, A), 200)
 check("reset password", call(users, "POST", f"/api/users/{e1['user']['id']}/reset-password", None, A), 200)
-check("employee cannot create", call(users, "POST", "/api/users", {"name": "Z", "email": "z@a.com", "role": "employee"}, E), 403)
+check("employee cannot create", call(users, "POST", "/api/users", {"name": "Z", "email": f"z@{TAG}.test", "role": "employee"}, E), 403)
 check("admin cannot demote self", call(users, "PATCH", f"/api/users/{admin_id}", {"role": "employee"}, A), 400)
 check("bad id", call(users, "GET", "/api/users/notauuid", None, A), 400)
 print("ALL USERS TESTS PASSED")

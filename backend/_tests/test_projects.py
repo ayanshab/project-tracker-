@@ -14,6 +14,8 @@ for k, v in {"POSTGRES_HOST": "localhost", "POSTGRES_PORT": "5432", "POSTGRES_US
              "POSTGRES_PASS": "postgres123", "POSTGRES_NAME": "postgres"}.items():
     os.environ.setdefault(k, v)
 sys.path.insert(0, os.path.join(BACKEND, "auth"))
+import uuid
+TAG = uuid.uuid4().hex[:8]  # unique emails so the suite can run repeatedly
 def load(n, p):
     s = importlib.util.spec_from_file_location(n, p); m = importlib.util.module_from_spec(s); s.loader.exec_module(m); return m
 auth = load("a", os.path.join(BACKEND, "auth", "function.py")); users = load("u", os.path.join(BACKEND, "users", "function.py")); proj = load("p", os.path.join(BACKEND, "projects", "function.py"))
@@ -28,8 +30,8 @@ def check(label, got, want):
 A = call(auth, "POST", "/api/auth/login", {"username": "admin", "password": "Admin123!"})[1]["token"]
 mk = lambda n, e, r, mgr=None, pay=50: call(users, "POST", "/api/users", {"name": n, "email": e, "role": r, "manager_id": mgr, "pay_rate": pay}, A)[1]
 lg = lambda u: call(auth, "POST", "/api/auth/login", {"username": u["user"]["username"], "password": u["temporary_password"]})[1]["token"]
-m = mk("Maria", "maria@a.com", "manager"); m2 = mk("Omar", "omar@a.com", "manager")
-e1 = mk("Eli", "eli@a.com", "employee", m["user"]["id"], 40); e2 = mk("Eve", "eve@a.com", "employee", m2["user"]["id"])
+m = mk("Maria", f"maria@{TAG}.test", "manager"); m2 = mk("Omar", f"omar@{TAG}.test", "manager")
+e1 = mk("Eli", f"eli@{TAG}.test", "employee", m["user"]["id"], 40); e2 = mk("Eve", f"eve@{TAG}.test", "employee", m2["user"]["id"])
 M, M2, E = lg(m), lg(m2), lg(e1)
 P = "/api/projects"
 check("employee cannot create", call(proj, "POST", P, {"name": "x", "start_date": "2026-01-01", "end_date": "2026-12-31"}, E), 403)
