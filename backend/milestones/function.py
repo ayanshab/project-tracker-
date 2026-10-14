@@ -21,8 +21,9 @@ Routes (all under /api/milestones, all require Authorization: Bearer <token>):
 
 Rules:
     - Milestones run in sequence like a project plan: #2 cannot start until #1 is completed.
-    - Date ranges cannot overlap: each milestone starts after the previous one ends,
-      and all milestones sit inside the project dates.
+    - Date ranges cannot overlap: each milestone starts on or after the day the previous one
+      ends (a shared handoff day is fine, so same-day milestones work), and all milestones sit
+      inside the project dates.
     - Many people can work on one milestone, but each person has at most one
       open (not completed) milestone per project at a time.
     - Employees check off tasks; only the project's manager or an admin completes a milestone.
@@ -117,17 +118,19 @@ def _check_dates(project, start, end, prev=None, nxt=None):
             400,
             f"Milestone dates must fall within the project ({project['start_date']} to {project['end_date']})",
         )
-    if prev and start <= prev["end_date"]:
+    # A handoff day is allowed: a milestone may start on the day the previous one ends,
+    # so several short milestones can share one day while staying in order.
+    if prev and start < prev["end_date"]:
         raise ApiError(
             409,
             f"Overlaps milestone #{prev['position']} '{prev['name']}', which ends {prev['end_date']}. "
-            "Start after that date.",
+            "Start on or after that date.",
         )
-    if nxt and end >= nxt["start_date"]:
+    if nxt and end > nxt["start_date"]:
         raise ApiError(
             409,
             f"Overlaps milestone #{nxt['position']} '{nxt['name']}', which starts {nxt['start_date']}. "
-            "End before that date.",
+            "End on or before that date.",
         )
 
 

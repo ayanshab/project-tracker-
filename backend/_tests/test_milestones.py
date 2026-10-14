@@ -81,6 +81,11 @@ check("add task to M2", call(mil, "POST", f"{P}/{m2['id']}/tasks", {"title": "AP
 check("force-complete M2 with open task", call(mil, "POST", f"{P}/{m2['id']}/complete", {"force": True}, M), 200)
 check("cannot delete started milestone", call(mil, "DELETE", f"{P}/{m2['id']}", None, M), 409)
 m4 = check("create M4", call(mil, "POST", P, {"project_id": p["id"], "name": "Retro", "start_date": "2026-09-01", "end_date": "2026-09-30"}, M), 201)["milestone"]
+m5 = check("M5 starting on M4's last day allowed", call(mil, "POST", P, {"project_id": p["id"], "name": "Wrap", "start_date": "2026-09-30", "end_date": "2026-09-30"}, M), 201)["milestone"]
+m6 = check("M6 on the same single day allowed", call(mil, "POST", P, {"project_id": p["id"], "name": "Sign-off", "start_date": "2026-09-30", "end_date": "2026-09-30"}, M), 201)["milestone"]
+check("M7 starting before M6 ends rejected", call(mil, "POST", P, {"project_id": p["id"], "name": "x", "start_date": "2026-09-29", "end_date": "2026-10-02"}, M), 409)
+check("delete same-day M6", call(mil, "DELETE", f"{P}/{m6['id']}", None, M), 200)
+check("delete same-day M5", call(mil, "DELETE", f"{P}/{m5['id']}", None, M), 200)
 check("delete pending M3", call(mil, "DELETE", f"{P}/{m3['id']}", None, M), 200)
 s, b = call(mil, "GET", P, None, M, {"project_id": p["id"]})
 print("    positions after delete:", [(x["position"], x["name"]) for x in b["milestones"]]); assert [x["position"] for x in b["milestones"]] == [1, 2, 3]

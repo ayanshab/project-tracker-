@@ -135,7 +135,7 @@ function Milestones({ project, milestones, manage, reload }) {
         {milestones.length ? (
           <>
             <MilestoneLine milestones={milestones} onSelect={select} selectedId={selectedId} />
-            <p className="muted small">Milestones run in order. Each one starts after the previous one is completed, and their dates cannot overlap.</p>
+            <p className="muted small">Milestones run in order. Each one starts after the previous one is completed, and their dates cannot overlap (a milestone can start on the day the previous one ends).</p>
           </>
         ) : (
           <Empty title="No milestones yet" action={manage && <Button onClick={() => setAdding(true)}>Add the first milestone</Button>}>
