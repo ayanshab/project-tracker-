@@ -84,8 +84,38 @@ ef = call(proj, "GET", P, None, E)[1]["project"]["forecast"]
 assert "forecast_cost" not in ef and "cpi" not in ef and "forecast_finish" in ef; print("PASS employees see schedule forecast only, no cost figures")
 el = next(x for x in call(proj, "GET", "/api/projects", None, E)[1]["projects"] if x["id"] == p["id"])
 assert "planned_budget" not in el and "total_cost" not in el; print("PASS project list hides budget figures from employees")
+# ---------- Health score: green / yellow / red with reasons ----------
+h = call(proj, "GET", P, None, M)[1]["project"]
+print("    health:", h["health"], [f"{r['area']}/{r['level']}: {r['text']}" for r in h["health_reasons"]])
+areas = {r["area"] for r in h["health_reasons"]}
+assert h["health"] == "red" and {"schedule", "budget"} <= areas, h["health_reasons"]
+assert h["projected_completion"] >= today.isoformat() and h["projected_completion_basis"]; print("PASS scored with reasons; projected completion", h["projected_completion"], "from", h["projected_completion_basis"])
+assert h["schedule"] and h["schedule"]["critical_path"] and h["schedule"]["critical_length_days"] == 101; print("PASS detail carries the critical path summary")
+eh = call(proj, "GET", P, None, E)[1]["project"]
+assert eh["health"] == h["health"] and not any(r["area"] == "budget" for r in eh["health_reasons"]); print("PASS employees see the same colour but no budget reasons")
 for t in tasks[1:]:
     call(mil, "PATCH", f"/api/milestones/tasks/{t['id']}", {"completed": True}, E)
 f2 = call(proj, "GET", P, None, M)[1]["project"]["forecast"]
 assert f2["spi"] > f["spi"]; print(f"PASS finishing tasks improves the forecast: SPI {f['spi']} to {f2['spi']}")
+# A fresh project with a clean plan and nothing wrong is green.
+g = call(proj, "POST", "/api/projects", {"name": f"Green P {tag}", "start_date": d(-10), "end_date": d(80), "planned_budget": 50000, "budget_hours": 400}, M)[1]["project"]
+emp2, E2 = person("Fcalm", "employee", mgr["id"])
+call(proj, "POST", f"/api/projects/{g['id']}/members", {"user_id": emp2["id"], "hours_per_week": 8, "assigned_from": d(-10)}, M)
+gm = call(mil, "POST", "/api/milestones", {"project_id": g["id"], "name": "Only", "start_date": d(-10), "end_date": d(80)}, M)[1]["milestone"]
+call(mil, "POST", f"/api/milestones/{gm['id']}/start", None, M)
+gh = call(proj, "GET", f"/api/projects/{g['id']}", None, M)[1]["project"]
+assert gh["health"] == "green" and gh["health_reasons"] == [], gh["health_reasons"]; print("PASS a project on plan is green")
+# Overloading a team member turns resources red; an overdue milestone turns milestones yellow.
+other = call(proj, "POST", "/api/projects", {"name": f"Overload P {tag}", "start_date": d(0), "end_date": d(60)}, M)[1]["project"]
+proj.execute("INSERT INTO project_members (project_id, user_id, hours_per_week, assigned_from) VALUES (%s, %s, 40, %s)", (other["id"], emp2["id"], d(0)))
+gh = call(proj, "GET", f"/api/projects/{g['id']}", None, M)[1]["project"]
+res = [r for r in gh["health_reasons"] if r["area"] == "resources"]
+assert gh["health"] == "red" and res and res[0]["level"] == "red" and "48 h/week" in res[0]["text"]; print("PASS a team member over 40 h turns the project red:", res[0]["text"])
+proj.execute("DELETE FROM project_members WHERE project_id = %s", (other["id"],))
+proj.execute("UPDATE milestones SET end_date = %s WHERE id = %s", (d(-1), gm["id"]))
+gh = call(proj, "GET", f"/api/projects/{g['id']}", None, M)[1]["project"]
+ms = [r for r in gh["health_reasons"] if r["area"] == "milestones"]
+assert ms and "overdue" in ms[0]["text"] and gh["health"] != "green"; print("PASS an overdue milestone is reported:", ms[0]["text"])
+reds = call(proj, "GET", "/api/projects", None, M, {"health": "red"})[1]["projects"]
+assert all(x["health"] == "red" for x in reds); print("PASS list filters by health colour")
 print("ALL FORECAST TESTS PASSED")

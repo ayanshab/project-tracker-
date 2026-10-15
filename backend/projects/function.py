@@ -4,7 +4,8 @@ completion, archiving, and resource allocation.
 
 Routes (all under /api/projects, all require Authorization: Bearer <token>):
     GET    /                          -> list visible projects with health + budget stats
-                                         query: q, status=active|completed, archived=true (admin)
+                                         query: q, status=active|completed, archived=true (admin),
+                                         health=green|yellow|red, at_risk=true
     GET    /allocation                -> load per person per week across active projects (admin, manager)
                                          query: from (snapped to Monday), weeks (default 12, max 26)
     GET    /capacity                  -> preview before assigning: user_id, hours, from, to, project_id?
@@ -26,6 +27,12 @@ Maker-checker: changes to planned_budget, budget_hours or manager_id are not app
 They become a pending request (a "reason" is required) that a different admin must approve.
 
 Forecast: every project carries an earned value forecast (SPI, CPI, forecast cost and finish date).
+
+Health: every project is scored green, yellow or red with the reasons, across four areas:
+schedule (planned vs actual progress, critical path delay), budget (actual vs planned spend),
+milestones (overdue milestones and their open tasks), resources (team members over 40 h/week).
+projected_completion is the latest of the critical path projection, the earned value pace, and
+the remaining budgeted hours at the team's weekly capacity.
 
 Rules:
     - A project always has exactly one manager (admins pick it; managers own what they create).
@@ -54,6 +61,8 @@ from common import (
     response,
 )
 from db import DatabaseUnavailable, ensure_schema, execute, query, query_one
+from schedule import build_schedule
+import math
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -222,11 +231,14 @@ def _health(row, today=None):
 # ---------- Forecasting (earned value management) ----------
 
 MILESTONE_PROGRESS_SQL = """
-SELECT m.id, m.project_id, m.position, m.name, m.status, m.start_date, m.end_date,
-       COALESCE(t.total, 0) AS tasks_total, COALESCE(t.done, 0) AS tasks_completed
+SELECT m.id, m.project_id, m.position, m.name, m.status, m.start_date, m.end_date, m.completed_at,
+       COALESCE(t.total, 0) AS tasks_total, COALESCE(t.done, 0) AS tasks_completed,
+       COALESCE(d.deps, '{}') AS depends_on
 FROM milestones m
 LEFT JOIN (SELECT milestone_id, COUNT(*) AS total, COUNT(*) FILTER (WHERE completed) AS done
            FROM tasks GROUP BY milestone_id) t ON t.milestone_id = m.id
+LEFT JOIN (SELECT milestone_id, array_agg(depends_on_id::text) AS deps
+           FROM milestone_dependencies GROUP BY milestone_id) d ON d.milestone_id = m.id
 """
 
 
@@ -328,7 +340,157 @@ def _apply_forecast(p, stops):
     return p
 
 
+# ---------- Health scoring ----------
+#
+# Four areas, each checked for a yellow (watch) or red (act) condition:
+#   schedule   planned progress vs actual progress (earned value SPI, forecast finish, critical path delay)
+#   budget     actual spend vs planned spend (CPI, forecast cost, budget used vs time elapsed)
+#   milestones overdue milestones and the open tasks on them, weighted by whether they are on the critical path
+#   resources  anyone on the team booked over the 40-hour week during the rest of the project
+# The project is red if any area is red, yellow if any is yellow, otherwise green.
+
+def _team_load(project, members_assignments, today):
+    """Busiest week per team member between today and the project end, across all their projects."""
+    end = max(project["end_date"], today)
+    out = []
+    for name, assignments in members_assignments.items():
+        weeks = weekly_load(assignments, today, end)
+        peak = max((w["hours"] for w in weeks), default=0.0)
+        out.append((name, peak))
+    return out
+
+
+def _score_health(p, stops, members_assignments=None, today=None):
+    """Add health (green/yellow/red), health_reasons and a projected completion date to a project."""
+    today = today or date.today()
+    f = p.get("forecast") or {}
+    reasons = []
+
+    def add(area, level, text):
+        reasons.append({"area": area, "level": level, "text": text})
+
+    if p["status"] == "completed":
+        p.update({"health": "green", "health_reasons": [], "projected_completion": p["end_date"],
+                  "projected_completion_basis": "Completed", "schedule": None})
+        return p
+
+    sched = build_schedule(p, stops, today=today) if stops else None
+    planned_days = max((p["end_date"] - p["start_date"]).days, 1)
+
+    # Schedule: planned vs actual progress
+    if today > p["end_date"]:
+        add("schedule", "red", f"Past the end date by {(today - p['end_date']).days} days")
+    elif sched and sched["days_past_project_end"] > max(14, 0.1 * planned_days):
+        add("schedule", "red", f"Critical path finishes {sched['days_past_project_end']} days after the end date")
+    elif sched and sched["days_past_project_end"] > 0:
+        add("schedule", "yellow", f"Critical path finishes {sched['days_past_project_end']} days after the end date")
+    if f.get("available"):
+        if f["spi"] is not None and f["spi"] < 0.8:
+            add("schedule", "red", f"Only {f['earned_pct']}% of the work is done where {f['planned_pct']}% was planned (SPI {f['spi']})")
+        elif f["spi"] is not None and f["spi"] < 0.95:
+            add("schedule", "yellow", f"{f['earned_pct']}% of the work is done where {f['planned_pct']}% was planned (SPI {f['spi']})")
+        if f["days_late"] is not None and f["days_late"] > 7 and not any(r["area"] == "schedule" and r["level"] == "red" for r in reasons):
+            add("schedule", "yellow" if f["days_late"] <= 14 else "red", f"At the current pace the project finishes {f['days_late']} days late")
+    elif p["milestones_total"] and p["time_elapsed_pct"] - p["progress_pct"] >= 25:
+        add("schedule", "yellow", f"{p['time_elapsed_pct']}% of the time has passed but only {p['progress_pct']}% of milestones are done")
+
+    # Budget: actual vs planned spend
+    bac = float(p["planned_budget"])
+    if p["budget_used_pct"] is not None and p["budget_used_pct"] > 100:
+        add("budget", "red", f"Over budget: {p['budget_used_pct']}% of ${bac:,.0f} spent")
+    elif f.get("available") and f.get("forecast_variance") is not None and bac > 0 and f["forecast_variance"] < -0.10 * bac:
+        add("budget", "red", f"Forecast ${-f['forecast_variance']:,.0f} over budget (CPI {f['cpi']})")
+    elif f.get("available") and f.get("forecast_variance") is not None and bac > 0 and f["forecast_variance"] < -0.05 * bac:
+        add("budget", "yellow", f"Forecast ${-f['forecast_variance']:,.0f} over budget (CPI {f['cpi']})")
+    elif p["budget_used_pct"] is not None and p["budget_used_pct"] > p["time_elapsed_pct"] + 25:
+        add("budget", "yellow", f"{p['budget_used_pct']}% of the budget spent with {p['time_elapsed_pct']}% of the time elapsed")
+    if p["hours_used_pct"] is not None and p["hours_used_pct"] > 100:
+        add("budget", "yellow", f"{p['hours_used_pct']}% of the budgeted hours used")
+
+    # Milestones and tasks
+    overdue = [m for m in stops if m["status"] != "completed" and today > m["end_date"]]
+    if overdue:
+        open_tasks = sum(m["tasks_total"] - m["tasks_completed"] for m in overdue)
+        critical_ids = set(sched["critical_path"]) if sched else set()
+        on_path = [m for m in overdue if str(m["id"]) in critical_ids]
+        worst = max((today - m["end_date"]).days for m in overdue)
+        text = f"{len(overdue)} overdue milestone{'s' if len(overdue) > 1 else ''}" \
+               f" ({', '.join(m['name'] for m in overdue[:3])}{', more' if len(overdue) > 3 else ''})" \
+               f"{f' with {open_tasks} open task{'s' if open_tasks != 1 else ''}' if open_tasks else ''}"
+        add("milestones", "red" if (on_path and worst > 7) else "yellow", text + (", on the critical path" if on_path else ""))
+
+    # Resources: anyone on the team over the 40-hour week in the weeks ahead
+    for name, peak in _team_load(p, members_assignments or {}, today):
+        if peak > WEEKLY_CAP:
+            add("resources", "red", f"{name} is booked {peak:g} h/week across projects (limit {WEEKLY_CAP:g})")
+        elif peak >= NEAR_CAPACITY:
+            add("resources", "yellow", f"{name} is at {peak:g} h/week across projects")
+
+    # Projected completion: the latest of the critical path projection, the earned value forecast,
+    # and how long the remaining budgeted hours take at the team's weekly capacity.
+    candidates = []
+    if sched:
+        candidates.append((sched["projected_finish"], "critical path at current progress"))
+    if f.get("available") and f.get("forecast_finish"):
+        candidates.append((f["forecast_finish"], "earned value pace (SPI)"))
+    budget_hours, logged = float(p["budget_hours"]), float(p["hours_logged"])
+    capacity = sum(float(a["hours_per_week"]) for rows in (members_assignments or {}).values() for a in rows
+                   if str(a["project_id"]) == str(p["id"]) and a["assigned_to"] >= today)
+    if budget_hours > logged and capacity > 0:
+        weeks = (budget_hours - logged) / capacity
+        candidates.append((today + timedelta(days=math.ceil(weeks * 7)), f"{budget_hours - logged:g} h of work left at {capacity:g} h/week"))
+    if candidates:
+        finish, basis = max(candidates, key=lambda c: c[0])
+        finish = max(finish, today)
+    else:
+        finish, basis = p["end_date"], "planned end date"
+
+    level = "red" if any(r["level"] == "red" for r in reasons) else "yellow" if reasons else "green"
+    p.update({
+        "health": level,
+        "health_reasons": reasons,
+        "projected_completion": finish,
+        "projected_completion_basis": basis,
+        "projected_days_late": max((finish - p["end_date"]).days, 0),
+        "schedule": {k: sched[k] for k in ("critical_path", "critical_length_days", "earliest_finish",
+                                            "projected_finish", "delay_days", "days_past_project_end")} if sched else None,
+    })
+    # Keep the older fields in step with the score so every page agrees.
+    p["at_risk"] = level != "green" or p["at_risk"]
+    return p
+
+
+def _assignments_for_projects(project_ids, today):
+    """{project_id: {member name: [assignments across ALL their active projects]}} for resource checks."""
+    members = query(
+        "SELECT pm.project_id, u.id AS user_id, u.name FROM project_members pm JOIN users u ON u.id = pm.user_id "
+        "WHERE pm.project_id = ANY(%s) AND u.is_archived = FALSE",
+        (list(project_ids),),
+    )
+    if not members:
+        return {}
+    user_ids = list({str(m["user_id"]) for m in members})
+    rows = query(
+        """
+        SELECT pm.user_id, pm.project_id, p.name AS project_name, pm.hours_per_week,
+               pm.assigned_from, COALESCE(pm.assigned_to, p.end_date) AS assigned_to
+        FROM project_members pm JOIN projects p ON p.id = pm.project_id
+        WHERE pm.user_id = ANY(%s::uuid[]) AND p.is_archived = FALSE AND p.status = 'active'
+          AND COALESCE(pm.assigned_to, p.end_date) >= %s
+        """,
+        (user_ids, today),
+    )
+    by_user = {}
+    for r in rows:
+        by_user.setdefault(str(r["user_id"]), []).append(r)
+    out = {}
+    for m in members:
+        out.setdefault(str(m["project_id"]), {})[m["name"]] = by_user.get(str(m["user_id"]), [])
+    return out
+
+
 def _hide_cost_forecast(p):
+    p["health_reasons"] = [r for r in p.get("health_reasons", []) if r["area"] != "budget"]
     f = p.get("forecast") or {}
     for k in ("planned_value", "earned_value", "actual_cost", "cpi", "cost_health", "forecast_cost", "forecast_variance"):
         f.pop(k, None)
@@ -550,15 +712,19 @@ def list_projects(viewer, params):
         for s in stops:
             s["overdue"] = s["status"] != "completed" and today > s["end_date"]
             by_project.setdefault(s["project_id"], []).append(s)
+        loads = _assignments_for_projects([p["id"] for p in projects], today)
         for p in projects:
             p["milestones"] = by_project.get(p["id"], [])
             _apply_forecast(p, p["milestones"])
+            _score_health(p, p["milestones"], loads.get(str(p["id"]), {}), today)
             if viewer["role"] == "employee":
                 _hide_cost_forecast(p)
                 for key in ("labor_cost", "other_cost", "total_cost", "planned_budget", "budget_used_pct"):
                     p.pop(key, None)
     if str(params.get("at_risk", "")).lower() == "true":
         projects = [p for p in projects if p["at_risk"]]
+    if params.get("health") in ("green", "yellow", "red"):
+        projects = [p for p in projects if p["health"] == params["health"]]
     return response(200, {"projects": projects})
 
 
@@ -568,6 +734,7 @@ def _project_detail(viewer, project_id):
     detail = _health(row)
     stops = query(f"{MILESTONE_PROGRESS_SQL} WHERE m.project_id = %s ORDER BY m.position", (project["id"],))
     _apply_forecast(detail, stops)
+    _score_health(detail, stops, _assignments_for_projects([project["id"]], date.today()).get(str(project["id"]), {}))
     members = query(
         """
         SELECT u.id AS user_id, u.name, u.email, u.job_title, u.role,

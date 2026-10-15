@@ -7,9 +7,10 @@ import {
   formToObject, useAction, useApi, useToast,
 } from '../components/ui'
 import MilestoneLine from '../components/MilestoneLine'
-import { RiskTags } from '../components/ProjectRow'
 import { ProjectForm } from './Projects'
 import Forecast from '../components/Forecast'
+import Gantt from '../components/Gantt'
+import { HealthTags, HealthReasons } from '../components/ProjectRow'
 import { CapacityNote, MilestonePeoplePicker, TaskRows, TeamPicker, toAssignments } from '../components/Pickers'
 import { ChangeList, decidePath } from './Approvals'
 import { BUDGET_STATUS, MILESTONE_STATUS, fmtDate, fmtHours, fmtMoney, fmtPct, fmtShort, todayISO } from '../utils/format'
@@ -47,7 +48,7 @@ export default function ProjectDetail() {
       <PageHeader
         crumbs={<Link to={p.is_archived ? '/archive' : '/projects'}>{p.is_archived ? 'Archive' : 'Projects'}</Link>}
         title={p.name}
-        tags={<RiskTags project={p} />}
+        tags={<HealthTags project={p} />}
         subtitle={p.description}
         meta={`Managed by ${p.manager_name}. Runs ${fmtDate(p.start_date)} to ${fmtDate(p.end_date)}.`}
         actions={(manage || isAdmin) && (
@@ -70,14 +71,17 @@ export default function ProjectDetail() {
       </div>
 
       <div className="tabs" role="tablist">
-        {[['milestones', 'Milestones'], ['team', 'Team'], ['forecast', 'Forecast'], ...(p.can_manage ? [['budget', 'Budget']] : [])].map(([k, label]) => (
+        {[['milestones', 'Milestones'], ['timeline', 'Timeline'], ['team', 'Team'], ['forecast', 'Forecast'], ...(p.can_manage ? [['budget', 'Budget']] : [])].map(([k, label]) => (
           <button key={k} role="tab" aria-selected={tab === k} className={`tab ${tab === k ? 'active' : ''}`} onClick={() => setTab(k)}>{label}</button>
         ))}
       </div>
 
       {p.can_manage && p.pending_changes?.length > 0 && <PendingChanges projectId={p.id} onChanged={reload} />}
 
+      {p.status === 'active' && p.health_reasons?.length > 0 && <HealthReasons project={p} />}
+
       {tab === 'forecast' && <Forecast project={p} />}
+      {tab === 'timeline' && <Gantt projectId={p.id} canManage={p.can_manage} />}
       {tab === 'milestones' && <Milestones project={p} milestones={milestones} manage={manage} reload={reload} />}
       {tab === 'team' && <Team project={p} manage={manage} reload={reload} />}
       {tab === 'budget' && p.can_manage && <Budget project={p} manage={manage} />}
@@ -137,7 +141,7 @@ function Milestones({ project, milestones, manage, reload }) {
         {milestones.length ? (
           <>
             <MilestoneLine milestones={milestones} onSelect={select} selectedId={selectedId} />
-            <p className="muted small">Milestones run in order. Each one starts after the previous one is completed, and their dates cannot overlap (a milestone can start on the day the previous one ends).</p>
+            <p className="muted small">A milestone can start once everything it depends on is completed. By default each one depends on the previous milestone; edit a milestone to change that, and milestones that don't depend on each other can run at the same time. The Timeline tab shows the critical path.</p>
           </>
         ) : (
           <Empty title="No milestones yet" action={manage && <Button onClick={() => setAdding(true)}>Add the first milestone</Button>}>
@@ -173,12 +177,15 @@ function MilestoneForm({ project, milestone, milestones = [], defaults = {}, onC
   // New milestones can be staffed and given tasks in the same step.
   const [people, setPeople] = useState([])
   const [tasks, setTasks] = useState([{ title: '', assigned_to: '' }])
+  // Which earlier milestones this one waits for. New milestones default to the previous one.
+  const earlier = milestones.filter((x) => (milestone ? x.position < milestone.position : true))
+  const [deps, setDeps] = useState(() => milestone ? (milestone.depends_on || []).map((d) => d.id) : earlier.length ? [earlier[earlier.length - 1].id] : [])
   const busy = {}
   milestones.filter((x) => x.status !== 'completed').forEach((x) => x.members.forEach((mem) => { busy[mem.user_id] = x.name }))
   const assignees = project.members.filter((x) => people.includes(x.user_id))
 
   const submit = async (fd) => {
-    const body = formToObject(fd)
+    const body = { ...formToObject(fd), depends_on: deps }
     const d = milestone
       ? await api.patch(`/milestones/${milestone.id}`, { ...body, description: fd.get('description') || '' })
       : await api.post('/milestones', {
@@ -199,6 +206,23 @@ function MilestoneForm({ project, milestone, milestones = [], defaults = {}, onC
       <Field label="Deliverables" wide hint="What has to be true for this milestone to be done"><textarea name="description" rows={3} defaultValue={milestone?.description || ''} /></Field>
       <Field label="Start date"><input name="start_date" type="date" required disabled={locked} min={project.start_date} max={project.end_date} defaultValue={milestone?.start_date || defaults.start_date} /></Field>
       <Field label="End date"><input name="end_date" type="date" required disabled={locked} min={project.start_date} max={project.end_date} defaultValue={milestone?.end_date} /></Field>
+      {earlier.length > 0 && (
+        <fieldset className="picker field-wide" disabled={locked}>
+          <legend className="field-label">Depends on <span className="muted">({deps.length ? `${deps.length} chosen` : 'nothing, can run alongside others'})</span></legend>
+          <ul className="pick-list">
+            {earlier.map((x) => (
+              <li key={x.id} className={deps.includes(x.id) ? 'on' : ''}>
+                <label className="pick-main">
+                  <input type="checkbox" checked={deps.includes(x.id)} onChange={(e) => setDeps((d) => e.target.checked ? [...d, x.id] : d.filter((i) => i !== x.id))} />
+                  <span>{x.position}. {x.name}<span className="muted small"> ends {fmtShort(x.end_date)}</span></span>
+                </label>
+                {x.status === 'completed' && <Tag tone="good">Done</Tag>}
+              </li>
+            ))}
+          </ul>
+          <span className="field-hint">This milestone can only start once the ticked milestones are completed, and must start on or after the day they end.</span>
+        </fieldset>
+      )}
       {!milestone && <MilestonePeoplePicker team={project.members} busy={busy} value={people} onChange={setPeople} />}
       {!milestone && <TaskRows rows={tasks} onChange={setTasks} assignees={assignees} />}
     </FormModal>
@@ -240,7 +264,7 @@ function MilestoneDetail({ id, project, milestones = [], manage, onChanged, onSe
       title={`Milestone ${m.position}: ${m.name}`}
       actions={manage && (
         <>
-          {m.status === 'pending' && <Button size="sm" disabled={!m.can_start} title={m.can_start ? '' : 'The previous milestone must be completed first'} onClick={() => run(() => api.post(`/milestones/${m.id}/start`), 'Milestone started')}>Start milestone</Button>}
+          {m.status === 'pending' && <Button size="sm" disabled={!m.can_start} title={m.can_start ? '' : `Waiting on ${(m.blocked_by || []).map((d) => d.name).join(' and ')}`} onClick={() => run(() => api.post(`/milestones/${m.id}/start`), 'Milestone started')}>Start milestone</Button>}
           {m.status === 'in_progress' && <Button size="sm" onClick={complete}>Complete milestone</Button>}
           {m.status === 'completed' && <Button size="sm" variant="ghost" onClick={() => run(() => api.post(`/milestones/${m.id}/reopen`), 'Milestone reopened')}>Reopen</Button>}
           <Button size="sm" variant="ghost" onClick={() => setEditing(true)}>Edit</Button>
@@ -251,7 +275,8 @@ function MilestoneDetail({ id, project, milestones = [], manage, onChanged, onSe
       <div className="row-tags">
         <Tag tone={status.tone}>{status.label}</Tag>
         {m.overdue && <Tag tone="bad">Overdue</Tag>}
-        {m.blocked_by_previous && <Tag tone="warn">Waiting on milestone {m.position - 1}</Tag>}
+        {m.blocked_by_previous && <Tag tone="warn">Waiting on {(m.blocked_by || []).map((d) => `#${d.position} ${d.name}`).join(', ')}</Tag>}
+        {m.depends_on?.length > 0 && !m.blocked_by_previous && m.status !== 'completed' && <Tag tone="muted">After {(m.depends_on || []).map((d) => `#${d.position}`).join(', ')}</Tag>}
         <span className="muted">{fmtShort(m.start_date)} to {fmtShort(m.end_date)}, {fmtHours(m.hours_logged)} logged</span>
       </div>
       {m.description && <p className="ms-desc">{m.description}</p>}
@@ -291,7 +316,7 @@ function MilestoneDetail({ id, project, milestones = [], manage, onChanged, onSe
         </div>
       </div>
 
-      {editing && <MilestoneForm project={project} milestone={m} onClose={() => setEditing(false)} onSaved={() => { setEditing(false); refresh() }} />}
+      {editing && <MilestoneForm project={project} milestone={m} milestones={milestones} onClose={() => setEditing(false)} onSaved={() => { setEditing(false); refresh() }} />}
       {addingMember && <AddMilestoneMember project={project} milestone={m} milestones={milestones} onClose={() => setAddingMember(false)} onSaved={() => { setAddingMember(false); refresh() }} />}
     </Panel>
   )

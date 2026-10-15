@@ -108,4 +108,50 @@ s, b = call(mil, "GET", P, None, M, {"project_id": q["id"]}); assert b["mileston
 k1 = check("new milestone with people and tasks", call(mil, "POST", P, {"project_id": q["id"], "name": "K1", "start_date": "2026-01-01", "end_date": "2026-01-31", "member_ids": [e1["user"]["id"]], "tasks": [{"title": "Kickoff", "assigned_to": e1["user"]["id"]}, {"title": "Shared notes"}, "Plain string task"]}, M), 201)["milestone"]
 assert [x["name"] for x in k1["members"]] == ["Ann"] and len(k1["tasks"]) == 3; print("PASS milestone created with 1 person and 3 tasks")
 check("person on open K1 cannot be put on new K2", call(mil, "POST", P, {"project_id": q["id"], "name": "K2", "start_date": "2026-02-01", "end_date": "2026-02-28", "member_ids": [e1["user"]["id"]]}, M), 409)
+# ---------- Dependencies, critical path and projected finish ----------
+# A fresh project with a diamond plan: Design -> (Build API, Build UI in parallel) -> Launch.
+pp = call(proj, "POST", "/api/projects", {"name": f"Diamond {tag}", "start_date": "2027-01-05", "end_date": "2027-04-30"}, M)[1]["project"]
+mk_ms = lambda name, start, end, **extra: call(mil, "POST", P, {"project_id": pp["id"], "name": name, "start_date": start, "end_date": end, **extra}, M)
+design = check("Design (no prerequisites)", mk_ms("Design", "2027-01-05", "2027-01-30"), 201)["milestone"]
+api = check("Build API after Design", mk_ms("Build API", "2027-01-30", "2027-03-13"), 201)["milestone"]
+assert [d["name"] for d in api["depends_on"]] == ["Design"]; print("PASS a new milestone depends on the previous one by default")
+check("Build UI overlapping Build API refused while it depends on it", mk_ms("Build UI", "2027-01-30", "2027-02-27"), 409)
+ui = check("Build UI in parallel, depending on Design only", mk_ms("Build UI", "2027-01-30", "2027-02-27", depends_on=[design["id"]]), 201)["milestone"]
+check("cannot depend on a later milestone", mk_ms("Bad", "2027-03-13", "2027-03-20", depends_on=[design["id"], "00000000-0000-0000-0000-000000000000"]), 400)
+launch = check("Launch after both builds", mk_ms("Launch", "2027-03-13", "2027-04-10", depends_on=[api["id"], ui["id"]]), 201)["milestone"]
+check("Launch cannot start before API ends", call(mil, "PATCH", f"{P}/{launch['id']}", {"start_date": "2027-03-01"}, M), 409)
+check("API cannot end after Launch starts", call(mil, "PATCH", f"{P}/{api['id']}", {"end_date": "2027-03-20"}, M), 409)
+check("Build UI may end later now that nothing follows it tightly", call(mil, "PATCH", f"{P}/{ui['id']}", {"end_date": "2027-03-06"}, M), 200)
+r = check("Build UI cannot start: Design not done", call(mil, "POST", f"{P}/{ui['id']}/start", None, M), 409); assert "Design" in r["error"]
+lst = call(mil, "GET", P, None, M, {"project_id": pp["id"]})[1]["milestones"]
+assert [x["name"] for x in lst if x["can_start"]] == ["Design"] and [d["name"] for d in next(x for x in lst if x["name"] == "Launch")["blocked_by"]] == ["Build API", "Build UI"]
+print("PASS list shows what each milestone is waiting on")
+sched = check("schedule", call(mil, "GET", f"{P}/schedule", None, M, {"project_id": pp["id"]}), 200)
+crit = [x["name"] for x in sched["milestones"] if x["critical"]]
+assert crit == ["Design", "Build API", "Launch"], crit; print("PASS critical path is Design > Build API > Launch (UI has slack):", crit)
+ui_s = next(x for x in sched["milestones"] if x["name"] == "Build UI"); assert ui_s["slack_days"] == 7 and ui_s["finish_impact_per_day"] == 0
+print("PASS Build UI has 7 days of slack (ends Mar 6, Launch starts Mar 13)")
+assert sched["earliest_finish"] == "2027-04-10" and sched["delay_days"] == 0 and sched["critical_length_days"] == 96
+sim = check("what if Build API slips 10 days", call(mil, "GET", f"{P}/schedule", None, M, {"project_id": pp["id"], "simulate": f"{api['id']}:10"}), 200)
+assert sim["projected_finish"] == "2027-04-20" and sim["delay_days"] == 10; print("PASS a 10-day slip on the critical path moves the finish 10 days")
+sim = call(mil, "GET", f"{P}/schedule", None, M, {"project_id": pp["id"], "simulate": f"{ui['id']}:5"})[1]
+assert sim["delay_days"] == 0; print("PASS a 5-day slip on Build UI is absorbed by its slack")
+sim = call(mil, "GET", f"{P}/schedule", None, M, {"project_id": pp["id"], "simulate": f"{ui['id']}:12"})[1]
+assert sim["delay_days"] == 5; print("PASS a 12-day slip on Build UI overruns its 7 days of slack by 5")
+check("simulate rejects junk", call(mil, "GET", f"{P}/schedule", None, M, {"project_id": pp["id"], "simulate": "nope"}), 400)
+# Start, complete and reopen follow the dependency graph, not the list order.
+call(mil, "POST", f"{P}/{design['id']}/start", None, M); check("complete Design", call(mil, "POST", f"{P}/{design['id']}/complete", {"force": True}, M), 200)
+check("Build UI (#3) can start before Build API (#2): both only need Design", call(mil, "POST", f"{P}/{ui['id']}/start", None, M), 200)
+check("Build API can start too, in parallel", call(mil, "POST", f"{P}/{api['id']}/start", None, M), 200)
+check("Design cannot reopen: dependents have started", call(mil, "POST", f"{P}/{design['id']}/reopen", None, M), 409)
+check("Launch cannot start: builds still open", call(mil, "POST", f"{P}/{launch['id']}/start", None, M), 409)
+check("API cannot depend on UI, which comes later in the list", call(mil, "PATCH", f"{P}/{api['id']}", {"depends_on": [design["id"], ui["id"]]}, M), 400)
+check("Launch may drop its UI dependency", call(mil, "PATCH", f"{P}/{launch['id']}", {"depends_on": [api["id"]]}, M), 200)
+call(mil, "POST", f"{P}/{api['id']}/complete", {"force": True}, M); call(mil, "POST", f"{P}/{launch['id']}/start", None, M)
+check("in-progress Launch cannot take on unfinished Build UI as a prerequisite", call(mil, "PATCH", f"{P}/{launch['id']}", {"depends_on": [api["id"], ui["id"]]}, M), 409)
+au = call(users, "GET", "/api/users/audit", None, A, {"entity_id": launch["id"], "action": "milestone.update"})[1]["entries"][0]
+assert au["details"]["changes"]["depends_on"] == ["Build API, Build UI", "Build API"]; print("PASS dependency change is audited:", au["details"]["changes"]["depends_on"])
+tl = check("portfolio timeline", call(mil, "GET", f"{P}/timeline", None, M), 200)
+assert any(x["name"].startswith("Diamond") and x["critical_path"] for x in tl["projects"]); print("PASS timeline lists projects with their critical path")
+check("employee not on the project cannot read its schedule", call(mil, "GET", f"{P}/schedule", None, O, {"project_id": pp["id"]}), 404)
 print("ALL MILESTONE TESTS PASSED")

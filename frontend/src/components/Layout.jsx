@@ -9,6 +9,7 @@ const NAV = {
   admin: [
     ['/', 'Overview'],
     ['/projects', 'Projects'],
+    ['/timeline', 'Timeline'],
     ['/people', 'People'],
     ['/allocation', 'Allocation'],
     ['/budgets', 'Budgets'],
@@ -22,6 +23,7 @@ const NAV = {
     ['/', 'Overview'],
     ['/my-work', 'My work'],
     ['/projects', 'Projects'],
+    ['/timeline', 'Timeline'],
     ['/people', 'My team'],
     ['/allocation', 'Allocation'],
     ['/budgets', 'Budgets'],

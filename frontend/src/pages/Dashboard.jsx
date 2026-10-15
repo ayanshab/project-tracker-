@@ -24,7 +24,8 @@ function ManagerHome({ user }) {
   if (error) return <ErrorNote error={error} onRetry={reload} />
 
   const active = data.projects.filter((p) => p.status === 'active')
-  const risky = active.filter((p) => p.at_risk)
+  const risky = active.filter((p) => p.health === 'red' || p.health === 'yellow' || (!p.health && p.at_risk))
+  const red = active.filter((p) => p.health === 'red').length
   const over = data.people.filter((p) => p.over_allocated)
   const free = data.people.filter((p) => p.hours_this_week === 0 && p.role !== 'admin')
   const t = data.portfolio.totals
@@ -40,7 +41,7 @@ function ManagerHome({ user }) {
       />
       <div className="stats">
         <Stat label="Active projects" value={active.length} />
-        <Stat label="Need attention" value={risky.length} tone={risky.length ? 'warn' : undefined} sub={risky.length ? 'Late, behind, or over budget' : 'Nothing at risk'} />
+        <Stat label="Project health" value={`${active.length - risky.length} / ${active.length}`} tone={red ? 'bad' : risky.length ? 'warn' : undefined} sub={risky.length ? `${red} red, ${risky.length - red} yellow` : 'All green'} />
         <Stat label="Over 40 h/week" value={over.length} tone={over.length ? 'bad' : undefined} sub={`${free.length} with no assignments`} />
         <Stat label="Budget used" value={usedPct === null ? '–' : `${usedPct}%`} sub={`${fmtMoney(t.actual_cost)} of ${fmtMoney(t.planned_budget)}`} />
       </div>

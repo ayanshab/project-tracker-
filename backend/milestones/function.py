@@ -3,16 +3,20 @@ Milestones service: ordered milestones inside a project, their teams, and
 the tasks employees check off.
 
 Routes (all under /api/milestones, all require Authorization: Bearer <token>):
-    GET    /?project_id=...              -> milestones of a project, in order, with progress
+    GET    /?project_id=...              -> milestones of a project, in order, with progress and dependencies
+    GET    /schedule?project_id=...      -> Gantt data: critical path, slack, projected dates and delay;
+                                            add simulate=<milestone_id>:<days> to test a slip
+    GET    /timeline                     -> every active project the caller can see, with its schedule
     GET    /mine                         -> caller's open milestones with their tasks (dashboard)
     GET    /{id}                         -> one milestone with members and tasks
     POST   /                             -> create {project_id, name, start_date, end_date, description?,
-                                            member_ids?: [user_id], tasks?: [{title, assigned_to?}]}
-    PATCH  /{id}                         -> edit name, description, dates
+                                            member_ids?: [user_id], tasks?: [{title, assigned_to?}],
+                                            depends_on?: [milestone_id] (default: the previous milestone)}
+    PATCH  /{id}                         -> edit name, description, dates, depends_on
     DELETE /{id}                         -> delete a milestone that has not started
-    POST   /{id}/start                   -> begin work (previous milestone must be completed)
+    POST   /{id}/start                   -> begin work (everything it depends on must be completed)
     POST   /{id}/complete                -> manager signs off; {"force": true} skips open tasks
-    POST   /{id}/reopen                  -> undo completion (only if the next one has not started)
+    POST   /{id}/reopen                  -> undo completion (only if nothing depending on it has started)
     POST   /{id}/members                 -> add {user_id} (must be on the project)
     DELETE /{id}/members/{user_id}       -> remove from milestone
     POST   /{id}/tasks                   -> add {title, description?, assigned_to?}
@@ -21,10 +25,14 @@ Routes (all under /api/milestones, all require Authorization: Bearer <token>):
     DELETE /tasks/{task_id}              -> delete a task (manager)
 
 Rules:
-    - Milestones run in sequence like a project plan: #2 cannot start until #1 is completed.
-    - Date ranges cannot overlap: each milestone starts on or after the day the previous one
-      ends (a shared handoff day is fine, so same-day milestones work), and all milestones sit
-      inside the project dates.
+    - Milestones depend on one another. A milestone cannot start until everything it depends on
+      is completed, and it may only depend on milestones earlier in the list (so there are no loops).
+      By default each new milestone depends on the one before it; managers can change that, and
+      milestones that do not depend on each other may run at the same time.
+    - A milestone starts on or after the day its prerequisites end (a shared handoff day is fine),
+      ends on or before the day its dependents start, and sits inside the project dates.
+    - The critical path is the chain of dependent milestones with no slack: a slip on any of them
+      moves the project finish. GET /schedule works this out and projects the finish date.
     - Many people can work on one milestone, but each person has at most one
       open (not completed) milestone per project at a time.
     - Employees check off tasks; only the project's manager or an admin completes a milestone.
@@ -36,6 +44,7 @@ from datetime import date
 
 from common import ApiError, audit, changes, error, get_current_user, parse_event, require_fields, response
 from db import DatabaseUnavailable, ensure_schema, execute, query, query_one
+from schedule import build_schedule
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -99,19 +108,55 @@ def _milestone(viewer, milestone_id, manage=False):
     return ms, project, can_manage
 
 
-def _neighbors(ms):
-    prev = query_one(
-        "SELECT * FROM milestones WHERE project_id = %s AND position < %s ORDER BY position DESC LIMIT 1",
-        (ms["project_id"], ms["position"]),
+def _prereqs(ms_id):
+    """Milestones this one depends on, earliest first."""
+    return query(
+        "SELECT m.* FROM milestone_dependencies d JOIN milestones m ON m.id = d.depends_on_id "
+        "WHERE d.milestone_id = %s ORDER BY m.position",
+        (ms_id,),
     )
-    nxt = query_one(
-        "SELECT * FROM milestones WHERE project_id = %s AND position > %s ORDER BY position LIMIT 1",
-        (ms["project_id"], ms["position"]),
-    )
-    return prev, nxt
 
 
-def _check_dates(project, start, end, prev=None, nxt=None):
+def _dependents(ms_id):
+    """Milestones that depend on this one."""
+    return query(
+        "SELECT m.* FROM milestone_dependencies d JOIN milestones m ON m.id = d.milestone_id "
+        "WHERE d.depends_on_id = %s ORDER BY m.position",
+        (ms_id,),
+    )
+
+
+def _validated_depends_on(project, body, position, default=None):
+    """Return the milestones a (new or edited) milestone at `position` may depend on.
+
+    Only earlier milestones of the same project are allowed, which keeps the graph free of loops.
+    When the body does not mention depends_on, `default` (usually the previous milestone) is used.
+    """
+    if "depends_on" not in body:
+        return default or []
+    raw = body.get("depends_on") or []
+    if not isinstance(raw, list):
+        raise ApiError(400, "depends_on must be a list of milestone ids")
+    seen, out = set(), []
+    for item in raw:
+        dep_id = _uuid(item, "depends_on")
+        if dep_id in seen:
+            continue
+        seen.add(dep_id)
+        dep = query_one("SELECT * FROM milestones WHERE id = %s AND project_id = %s", (dep_id, project["id"]))
+        if not dep:
+            raise ApiError(400, "Milestones can only depend on milestones in the same project")
+        if dep["position"] >= position:
+            raise ApiError(
+                400,
+                f"'{dep['name']}' comes later in the plan. A milestone can only depend on earlier milestones, "
+                "so the plan can never loop.",
+            )
+        out.append(dep)
+    return out
+
+
+def _check_dates(project, start, end, prereqs=(), dependents=()):
     if end < start:
         raise ApiError(400, "end_date must be on or after start_date")
     if start < project["start_date"] or end > project["end_date"]:
@@ -119,20 +164,22 @@ def _check_dates(project, start, end, prev=None, nxt=None):
             400,
             f"Milestone dates must fall within the project ({project['start_date']} to {project['end_date']})",
         )
-    # A handoff day is allowed: a milestone may start on the day the previous one ends,
+    # A handoff day is allowed: a milestone may start on the day a prerequisite ends,
     # so several short milestones can share one day while staying in order.
-    if prev and start < prev["end_date"]:
-        raise ApiError(
-            409,
-            f"Overlaps milestone #{prev['position']} '{prev['name']}', which ends {prev['end_date']}. "
-            "Start on or after that date.",
-        )
-    if nxt and end > nxt["start_date"]:
-        raise ApiError(
-            409,
-            f"Overlaps milestone #{nxt['position']} '{nxt['name']}', which starts {nxt['start_date']}. "
-            "End on or before that date.",
-        )
+    for prev in prereqs:
+        if start < prev["end_date"]:
+            raise ApiError(
+                409,
+                f"Depends on milestone #{prev['position']} '{prev['name']}', which ends {prev['end_date']}. "
+                "Start on or after that date, or remove the dependency.",
+            )
+    for nxt in dependents:
+        if end > nxt["start_date"]:
+            raise ApiError(
+                409,
+                f"Milestone #{nxt['position']} '{nxt['name']}' depends on this one and starts {nxt['start_date']}. "
+                "End on or before that date.",
+            )
 
 
 # ---------- Shaping ----------
@@ -156,19 +203,42 @@ LEFT JOIN (SELECT milestone_id, SUM(hours) AS hours FROM time_entries
 """
 
 
+def _deps_for_project(project_id):
+    """{milestone_id: [{id, position, name, status}, ...]} for every milestone in the project."""
+    rows = query(
+        """
+        SELECT d.milestone_id, m.id, m.position, m.name, m.status
+        FROM milestone_dependencies d JOIN milestones m ON m.id = d.depends_on_id
+        WHERE m.project_id = %s ORDER BY m.position
+        """,
+        (project_id,),
+    )
+    out = {}
+    for r in rows:
+        out.setdefault(str(r["milestone_id"]), []).append(
+            {"id": r["id"], "position": r["position"], "name": r["name"], "status": r["status"]})
+    return out
+
+
 def _shape(rows):
-    """Add progress and 'blocked by' info, using the ordered list."""
-    out, prev_done = [], True
+    """Add progress and 'blocked by' info from each milestone's dependencies."""
+    if not rows:
+        return []
+    deps = _deps_for_project(rows[0]["project_id"])
     today = date.today()
+    out = []
     for r in rows:
         item = dict(r)
+        mine = deps.get(str(r["id"]), [])
+        waiting = [d for d in mine if d["status"] != "completed"]
         item["progress_pct"] = round(100 * r["tasks_completed"] / r["tasks_total"]) if r["tasks_total"] else (
             100 if r["status"] == "completed" else 0)
-        item["can_start"] = r["status"] == "pending" and prev_done
-        item["blocked_by_previous"] = r["status"] == "pending" and not prev_done
+        item["depends_on"] = mine
+        item["blocked_by"] = waiting
+        item["can_start"] = r["status"] == "pending" and not waiting
+        item["blocked_by_previous"] = r["status"] == "pending" and bool(waiting)
         item["overdue"] = r["status"] != "completed" and today > r["end_date"]
         out.append(item)
-        prev_done = r["status"] == "completed"
     return out
 
 
@@ -233,7 +303,9 @@ def create_milestone(viewer, body):
     last = query_one(
         "SELECT * FROM milestones WHERE project_id = %s ORDER BY position DESC LIMIT 1", (project["id"],)
     )
-    _check_dates(project, start, end, prev=last)
+    position = (last["position"] + 1) if last else 1
+    prereqs = _validated_depends_on(project, body, position, default=[last] if last else [])
+    _check_dates(project, start, end, prereqs=prereqs)
     member_ids, tasks = _validated_new_milestone_people(project, body)
     row = execute(
         """
@@ -241,15 +313,18 @@ def create_milestone(viewer, body):
         VALUES (%s, %s, %s, %s, %s, %s) RETURNING id
         """,
         (
-            project["id"], (last["position"] + 1) if last else 1,
+            project["id"], position,
             _text(body["name"], "name"),
             _text(body.get("description"), "description", required=False, max_len=2000),
             start, end,
         ),
     )
     ms_name = body["name"].strip()
+    for dep in prereqs:
+        execute("INSERT INTO milestone_dependencies (milestone_id, depends_on_id) VALUES (%s, %s)", (row["id"], dep["id"]))
     audit(viewer, "milestone.create", "milestone", row["id"], ms_name,
-          {"project_id": project["id"], "project_name": project["name"], "start_date": start, "end_date": end})
+          {"project_id": project["id"], "project_name": project["name"], "start_date": start, "end_date": end,
+           "depends_on": [d["name"] for d in prereqs]})
     for user_id, user_name in member_ids:
         execute("INSERT INTO milestone_members (milestone_id, user_id) VALUES (%s, %s)", (row["id"], user_id))
         audit(viewer, "milestone.member_add", "milestone", row["id"], ms_name, {"user_id": user_id, "user_name": user_name})
@@ -316,21 +391,37 @@ def update_milestone(viewer, ms_id, body):
     if "description" in body:
         sets.append("description = %s")
         args.append(_text(body["description"], "description", required=False, max_len=2000))
-    if "start_date" in body or "end_date" in body:
+    new_deps = None
+    if "depends_on" in body:
         if ms["status"] == "completed":
+            raise ApiError(409, "Dependencies of a completed milestone cannot change")
+        new_deps = _validated_depends_on(project, body, ms["position"])
+        if ms["status"] == "in_progress" and any(d["status"] != "completed" for d in new_deps):
+            raise ApiError(409, "This milestone is already in progress, so it can only depend on completed milestones")
+    if "start_date" in body or "end_date" in body or new_deps is not None:
+        if ms["status"] == "completed" and ("start_date" in body or "end_date" in body):
             raise ApiError(409, "Dates of a completed milestone cannot change")
         start = _date(body["start_date"], "start_date") if "start_date" in body else ms["start_date"]
         end = _date(body["end_date"], "end_date") if "end_date" in body else ms["end_date"]
-        prev, nxt = _neighbors(ms)
-        _check_dates(project, start, end, prev, nxt)
-        sets += ["start_date = %s", "end_date = %s"]
-        args += [start, end]
-    if not sets:
+        prereqs = new_deps if new_deps is not None else _prereqs(ms["id"])
+        _check_dates(project, start, end, prereqs=prereqs, dependents=_dependents(ms["id"]))
+        if "start_date" in body or "end_date" in body:
+            sets += ["start_date = %s", "end_date = %s"]
+            args += [start, end]
+    if not sets and new_deps is None:
         raise ApiError(400, "No editable fields provided")
-    sets.append("updated_at = now()")
-    execute(f"UPDATE milestones SET {', '.join(sets)} WHERE id = %s", args + [ms["id"]])
+    old_deps = [d["name"] for d in _prereqs(ms["id"])]
+    if new_deps is not None:
+        execute("DELETE FROM milestone_dependencies WHERE milestone_id = %s", (ms["id"],))
+        for dep in new_deps:
+            execute("INSERT INTO milestone_dependencies (milestone_id, depends_on_id) VALUES (%s, %s)", (ms["id"], dep["id"]))
+    if sets:
+        sets.append("updated_at = now()")
+        execute(f"UPDATE milestones SET {', '.join(sets)} WHERE id = %s", args + [ms["id"]])
     after = query_one("SELECT * FROM milestones WHERE id = %s", (ms["id"],))
     diff = changes(ms, after, ("name", "description", "start_date", "end_date"))
+    if new_deps is not None and [d["name"] for d in new_deps] != old_deps:
+        diff["depends_on"] = [", ".join(old_deps) or "nothing", ", ".join(d["name"] for d in new_deps) or "nothing"]
     if diff:
         audit(viewer, "milestone.update", "milestone", ms["id"], after["name"],
               {"project_name": project["name"], "changes": diff})
@@ -345,6 +436,7 @@ def delete_milestone(viewer, ms_id):
         raise ApiError(409, "Time has been logged against this milestone, so it cannot be deleted")
     execute("DELETE FROM tasks WHERE milestone_id = %s", (ms["id"],))
     execute("DELETE FROM milestone_members WHERE milestone_id = %s", (ms["id"],))
+    execute("DELETE FROM milestone_dependencies WHERE milestone_id = %s OR depends_on_id = %s", (ms["id"], ms["id"]))
     execute("DELETE FROM milestones WHERE id = %s", (ms["id"],))
     audit(viewer, "milestone.delete", "milestone", ms["id"], ms["name"], {"project_id": ms["project_id"], "position": ms["position"]})
     # Close the gap in numbering (two steps to avoid clashing with the unique constraint).
@@ -359,9 +451,10 @@ def start_milestone(viewer, ms_id):
     ms, _, _ = _milestone(viewer, ms_id, manage=True)
     if ms["status"] != "pending":
         raise ApiError(409, f"Milestone is already {ms['status'].replace('_', ' ')}")
-    prev, _ = _neighbors(ms)
-    if prev and prev["status"] != "completed":
-        raise ApiError(409, f"Finish milestone #{prev['position']} '{prev['name']}' before starting this one")
+    waiting = [d for d in _prereqs(ms["id"]) if d["status"] != "completed"]
+    if waiting:
+        names = " and ".join(f"#{d['position']} '{d['name']}'" for d in waiting)
+        raise ApiError(409, f"Finish milestone {names} before starting this one. It depends on them.")
     execute("UPDATE milestones SET status = 'in_progress', updated_at = now() WHERE id = %s", (ms["id"],))
     audit(viewer, "milestone.start", "milestone", ms["id"], ms["name"], {"project_id": ms["project_id"]})
     return response(200, {"milestone": _detail(viewer, ms["id"])})
@@ -371,9 +464,10 @@ def complete_milestone(viewer, ms_id, body):
     ms, _, _ = _milestone(viewer, ms_id, manage=True)
     if ms["status"] == "completed":
         raise ApiError(409, "Milestone is already completed")
-    prev, _ = _neighbors(ms)
-    if prev and prev["status"] != "completed":
-        raise ApiError(409, f"Milestone #{prev['position']} '{prev['name']}' must be completed first")
+    waiting = [d for d in _prereqs(ms["id"]) if d["status"] != "completed"]
+    if waiting:
+        names = " and ".join(f"#{d['position']} '{d['name']}'" for d in waiting)
+        raise ApiError(409, f"Milestone {names} must be completed first. This one depends on them.")
     open_tasks = query_one(
         "SELECT COUNT(*) AS n FROM tasks WHERE milestone_id = %s AND completed = FALSE", (ms["id"],)
     )["n"]
@@ -395,15 +489,82 @@ def reopen_milestone(viewer, ms_id):
     ms, _, _ = _milestone(viewer, ms_id, manage=True)
     if ms["status"] != "completed":
         raise ApiError(409, "Only completed milestones can be reopened")
-    _, nxt = _neighbors(ms)
-    if nxt and nxt["status"] != "pending":
-        raise ApiError(409, f"Milestone #{nxt['position']} has already started, so this one cannot reopen")
+    started = [d for d in _dependents(ms["id"]) if d["status"] != "pending"]
+    if started:
+        raise ApiError(409, f"Milestone #{started[0]['position']} '{started[0]['name']}' depends on this one and has "
+                            "already started, so this one cannot reopen")
     execute(
         "UPDATE milestones SET status = 'in_progress', completed_at = NULL, updated_at = now() WHERE id = %s",
         (ms["id"],),
     )
     audit(viewer, "milestone.reopen", "milestone", ms["id"], ms["name"], {"project_id": ms["project_id"]})
     return response(200, {"milestone": _detail(viewer, ms["id"])})
+
+
+# ---------- Schedule: Gantt data, critical path, projected finish ----------
+
+SCHEDULE_SQL = """
+SELECT m.id, m.project_id, m.position, m.name, m.status, m.start_date, m.end_date, m.completed_at,
+       COALESCE(t.total, 0) AS tasks_total, COALESCE(t.done, 0) AS tasks_completed,
+       COALESCE(d.deps, '{}') AS depends_on
+FROM milestones m
+LEFT JOIN (SELECT milestone_id, COUNT(*) AS total, COUNT(*) FILTER (WHERE completed) AS done
+           FROM tasks GROUP BY milestone_id) t ON t.milestone_id = m.id
+LEFT JOIN (SELECT milestone_id, array_agg(depends_on_id::text) AS deps
+           FROM milestone_dependencies GROUP BY milestone_id) d ON d.milestone_id = m.id
+"""
+
+
+def _parse_simulate(params):
+    """simulate=<milestone_id>:<days>[,<id>:<days>] -> {id: days}."""
+    out = {}
+    for part in str(params.get("simulate", "") or "").split(","):
+        if not part.strip():
+            continue
+        if ":" not in part:
+            raise ApiError(400, "simulate must look like <milestone_id>:<days>")
+        mid, days = part.split(":", 1)
+        try:
+            out[_uuid(mid.strip(), "simulate")] = max(0, min(int(days), 365))
+        except ValueError:
+            raise ApiError(400, "simulate days must be a whole number")
+    return out
+
+
+def project_schedule(viewer, params):
+    project, can_manage = _project_access(viewer, params.get("project_id"))
+    rows = query(f"{SCHEDULE_SQL} WHERE m.project_id = %s ORDER BY m.position", (project["id"],))
+    sched = build_schedule(project, rows, simulate=_parse_simulate(params))
+    sched.update({"project_id": project["id"], "project_name": project["name"],
+                  "project_start": project["start_date"], "can_manage": can_manage})
+    return response(200, sched)
+
+
+def timeline(viewer):
+    """Every active project the caller can see, each with its schedule, for the portfolio Gantt."""
+    where, args = ["p.is_archived = FALSE", "p.status = 'active'"], []
+    if viewer["role"] != "admin":
+        where.append("(p.manager_id = %s OR EXISTS (SELECT 1 FROM project_members x "
+                     "WHERE x.project_id = p.id AND x.user_id = %s))")
+        args += [viewer["id"], viewer["id"]]
+    projects = query(
+        f"SELECT p.id, p.name, p.start_date, p.end_date, p.status, u.name AS manager_name FROM projects p "
+        f"JOIN users u ON u.id = p.manager_id WHERE {' AND '.join(where)} ORDER BY p.start_date, p.name",
+        args,
+    )
+    if not projects:
+        return response(200, {"projects": []})
+    rows = query(f"{SCHEDULE_SQL} WHERE m.project_id = ANY(%s) ORDER BY m.project_id, m.position",
+                 ([p["id"] for p in projects],))
+    by_project = {}
+    for r in rows:
+        by_project.setdefault(str(r["project_id"]), []).append(r)
+    out = []
+    for p in projects:
+        sched = build_schedule(p, by_project.get(str(p["id"]), []))
+        out.append({"id": p["id"], "name": p["name"], "manager_name": p["manager_name"],
+                    "start_date": p["start_date"], "end_date": p["end_date"], **sched})
+    return response(200, {"projects": out})
 
 
 # ---------- Members ----------
@@ -560,6 +721,10 @@ def handler(event=None, context=None):
                 return create_milestone(viewer, body)
         elif parts == ["mine"] and method == "GET":
             return my_milestones(viewer)
+        elif parts == ["schedule"] and method == "GET":
+            return project_schedule(viewer, params)
+        elif parts == ["timeline"] and method == "GET":
+            return timeline(viewer)
         elif parts[0] == "tasks" and len(parts) == 2:
             if method in ("PATCH", "PUT"):
                 return update_task(viewer, parts[1], body)

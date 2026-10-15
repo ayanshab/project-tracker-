@@ -188,6 +188,26 @@ CREATE TABLE IF NOT EXISTS tasks (
 );
 CREATE INDEX IF NOT EXISTS tasks_milestone_idx ON tasks(milestone_id);
 
+-- Which milestones must finish before another can start. A milestone may only depend on
+-- milestones with a lower position in the same project, so the graph can never loop.
+-- Created once; existing projects get the old rule (each milestone follows the previous one).
+DO $$
+BEGIN
+    IF to_regclass('milestone_dependencies') IS NULL THEN
+        CREATE TABLE milestone_dependencies (
+            milestone_id     UUID NOT NULL REFERENCES milestones(id),
+            depends_on_id    UUID NOT NULL REFERENCES milestones(id),
+            created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (milestone_id, depends_on_id),
+            CHECK (milestone_id <> depends_on_id)
+        );
+        CREATE INDEX milestone_dependencies_on_idx ON milestone_dependencies(depends_on_id);
+        INSERT INTO milestone_dependencies (milestone_id, depends_on_id)
+        SELECT m.id, prev.id FROM milestones m
+        JOIN milestones prev ON prev.project_id = m.project_id AND prev.position = m.position - 1;
+    END IF;
+END $$;
+
 CREATE TABLE IF NOT EXISTS time_entries (
     id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id          UUID NOT NULL REFERENCES users(id),

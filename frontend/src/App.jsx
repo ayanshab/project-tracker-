@@ -15,6 +15,7 @@ import Profile from './pages/Profile'
 import AuditLog from './pages/AuditLog'
 import SetPassword from './pages/SetPassword'
 import Approvals from './pages/Approvals'
+import Timeline from './pages/Timeline'
 
 function RequireRole({ roles, children }) {
   const { user } = useAuth()
@@ -32,6 +33,7 @@ function AppRoutes() {
         <Route index element={<Dashboard />} />
         <Route path="projects" element={<Projects />} />
         <Route path="projects/:id" element={<ProjectDetail />} />
+        <Route path="timeline" element={<Timeline />} />
         <Route path="people" element={<People />} />
         <Route path="time" element={<TimeLog />} />
         <Route path="my-work" element={<RequireRole roles={['admin', 'manager']}><MyWork /></RequireRole>} />
