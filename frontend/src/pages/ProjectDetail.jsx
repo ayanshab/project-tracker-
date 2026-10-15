@@ -10,7 +10,7 @@ import MilestoneLine from '../components/MilestoneLine'
 import { RiskTags } from '../components/ProjectRow'
 import { ProjectForm } from './Projects'
 import Forecast from '../components/Forecast'
-import { MilestonePeoplePicker, TaskRows, TeamPicker, toAssignments } from '../components/Pickers'
+import { CapacityNote, MilestonePeoplePicker, TaskRows, TeamPicker, toAssignments } from '../components/Pickers'
 import { ChangeList, decidePath } from './Approvals'
 import { BUDGET_STATUS, MILESTONE_STATUS, fmtDate, fmtHours, fmtMoney, fmtPct, fmtShort, todayISO } from '../utils/format'
 
@@ -447,7 +447,7 @@ function AddPeople({ project, onClose, onSaved }) {
   }
   return (
     <FormModal title="Add people to the project" submitLabel="Add to project" onClose={onClose} onSubmit={submit}>
-      <TeamPicker people={people.data || []} loading={people.loading} value={team} onChange={setTeam} later={false} minDate={project.start_date} maxDate={project.end_date} />
+      <TeamPicker people={people.data || []} loading={people.loading} value={team} onChange={setTeam} later={false} minDate={project.start_date} maxDate={project.end_date} projectId={project.id} />
     </FormModal>
   )
 }
@@ -455,6 +455,13 @@ function AddPeople({ project, onClose, onSaved }) {
 function MemberForm({ project, member, onClose, onSaved }) {
   const people = useApi(() => (member ? Promise.resolve([]) : api.get('/users').then((d) => d.users)), [])
   const options = (people.data || []).filter((u) => u.role !== 'admin' && !project.members.some((x) => x.user_id === u.id))
+  const [draft, setDraft] = useState({
+    user_id: member?.user_id || '',
+    hours_per_week: member?.hours_per_week ?? 8,
+    assigned_from: member?.assigned_from || (todayISO() > project.start_date ? todayISO() : project.start_date),
+    assigned_to: member?.assigned_to || '',
+  })
+  const set = (k) => (e) => setDraft((d) => ({ ...d, [k]: e.target.value }))
   const submit = async (fd) => {
     const body = formToObject(fd, ['hours_per_week'])
     if (!fd.get('assigned_to')) body.assigned_to = null
@@ -467,7 +474,7 @@ function MemberForm({ project, member, onClose, onSaved }) {
       {!member && (
         <Field label="Person" wide hint="Managers can add their direct reports. Admins can add anyone.">
           {people.loading ? <select disabled><option>Loading…</option></select> : (
-            <select name="user_id" required defaultValue="">
+            <select name="user_id" required value={draft.user_id} onChange={set('user_id')}>
               <option value="" disabled>Choose a person</option>
               {options.map((u) => <option key={u.id} value={u.id}>{u.name} ({u.job_title || u.role})</option>)}
             </select>
@@ -475,10 +482,11 @@ function MemberForm({ project, member, onClose, onSaved }) {
         </Field>
       )}
       <Field label="Hours per week" hint="Total across all projects cannot exceed 40.">
-        <input name="hours_per_week" type="number" min="0.5" max="40" step="0.5" required defaultValue={member?.hours_per_week ?? 8} />
+        <input name="hours_per_week" type="number" min="0.5" max="40" step="0.5" required value={draft.hours_per_week} onChange={set('hours_per_week')} />
       </Field>
-      <Field label="From"><input name="assigned_from" type="date" min={project.start_date} max={project.end_date} defaultValue={member?.assigned_from || (todayISO() > project.start_date ? todayISO() : project.start_date)} /></Field>
-      <Field label="Until" hint="Leave empty for the rest of the project"><input name="assigned_to" type="date" min={project.start_date} max={project.end_date} defaultValue={member?.assigned_to || ''} /></Field>
+      <Field label="From"><input name="assigned_from" type="date" min={project.start_date} max={project.end_date} value={draft.assigned_from} onChange={set('assigned_from')} /></Field>
+      <Field label="Until" hint="Leave empty for the rest of the project"><input name="assigned_to" type="date" min={project.start_date} max={project.end_date} value={draft.assigned_to} onChange={set('assigned_to')} /></Field>
+      <CapacityNote userId={draft.user_id} hours={draft.hours_per_week} from={draft.assigned_from} until={draft.assigned_to} projectId={project.id} fallbackFrom={project.start_date} fallbackUntil={project.end_date} />
     </FormModal>
   )
 }

@@ -99,4 +99,29 @@ print("PASS employee sees other-team colleague by name only:", sorted(eve.keys()
 check("remove member", call(proj, "DELETE", f"{P}/{p2['id']}/members/{e1['user']['id']}", None, A), 200)
 check("search", call(proj, "GET", P, None, A, {"q": "borea"}), 200)
 check("archiving manager with active project blocked", call(users, "POST", f"/api/users/{m2['user']['id']}/archive", None, A), 409)
+# ---------- Capacity heatmap and the pre-assignment preview ----------
+# Eve: 5 h on Borealis (Sep 1 to Dec 31). Two more projects, back to back, must not count against each other.
+q1 = check("Q1 project", call(proj, "POST", P, {"name": "Q1 Work", "start_date": "2027-01-04", "end_date": "2027-03-26", "manager_id": m2["user"]["id"]}, A), 201)["project"]
+q2 = check("Q2 project", call(proj, "POST", P, {"name": "Q2 Work", "start_date": "2027-03-29", "end_date": "2027-06-25", "manager_id": m2["user"]["id"]}, A), 201)["project"]
+check("Eve 35h on Q1", call(proj, "POST", f"{P}/{q1['id']}/members", {"user_id": e2["user"]["id"], "hours_per_week": 35, "assigned_from": "2027-01-04"}, A), 201)
+check("Eve 35h on Q2 too: no overlap, so it fits", call(proj, "POST", f"{P}/{q2['id']}/members", {"user_id": e2["user"]["id"], "hours_per_week": 35, "assigned_from": "2027-03-29"}, A), 201)
+q3 = check("year-long project", call(proj, "POST", P, {"name": "Platform", "start_date": "2027-01-01", "end_date": "2027-12-31", "manager_id": m2["user"]["id"]}, A), 201)["project"]
+r = check("Eve 10h more across both quarters: busiest week is 35h, refused", call(proj, "POST", f"{P}/{q3['id']}/members", {"user_id": e2["user"]["id"], "hours_per_week": 10, "assigned_from": "2027-02-01", "assigned_to": "2027-05-01"}, A), 409)
+assert "35 h/week" in r["error"] and "5 h/week available" in r["error"]; print("PASS refusal names the busiest week's load:", r["error"][:60])
+hm = check("heatmap window: 13 weeks from Dec 28", call(proj, "GET", f"{P}/allocation", None, A, {"from": "2026-12-30", "weeks": "13"}), 200)
+assert hm["from"] == "2026-12-28" and len(hm["weeks"]) == 13 and hm["near_capacity"] == 32; print("PASS window snaps to Monday and returns 13 week columns")
+eve = next(x for x in hm["people"] if x["name"] == "Eve")
+loads = [(w["week_start"], w["hours"], w["status"]) for w in eve["weeks"]]
+assert loads[0] == ("2026-12-28", 5.0, "ok") and loads[1] == ("2027-01-04", 35.0, "near"); print("PASS Eve: 5h over New Year, then 35h (near capacity) once Q1 starts")
+assert eve["weeks"][12]["week_start"] == "2027-03-22" and eve["weeks"][12]["hours"] == 35.0 and len(eve["weeks"][12]["assignments"]) == 1
+assert eve["peak_hours"] == 35.0 and eve["weeks_over"] == 0 and eve["weeks_near"] == 12; print("PASS per-week breakdown lists the projects behind each cell")
+check("heatmap rejects a silly window", call(proj, "GET", f"{P}/allocation", None, A, {"weeks": "lots"}), 400)
+cap = check("capacity preview: Eve +10h over Feb to May", call(proj, "GET", f"{P}/capacity", None, A, {"user_id": e2["user"]["id"], "hours": "10", "from": "2027-02-01", "to": "2027-05-01"}), 200)
+assert cap["booked_peak"] == 35.0 and cap["available"] == 5.0 and cap["with_new_peak"] == 45.0 and cap["status"] == "over" and cap["over_by"] == 5.0 and cap["weeks_over"] == 13
+assert cap["weeks"][0]["with_new"] == 45.0 and cap["weeks"][0]["status_with_new"] == "over"; print("PASS preview says over by 5h in all 13 weeks, starting", cap["worst_week"])
+cap = check("capacity preview: Eve +5h fits exactly", call(proj, "GET", f"{P}/capacity", None, A, {"user_id": e2["user"]["id"], "hours": "5", "from": "2027-02-01", "to": "2027-05-01"}), 200)
+assert cap["status"] == "near" and cap["over_by"] == 0; print("PASS 40h exactly is allowed but flagged as approaching capacity")
+check("capacity preview: manager cannot check another team", call(proj, "GET", f"{P}/capacity", None, M, {"user_id": e2["user"]["id"], "hours": "5"}), 403)
+check("capacity preview: employee forbidden", call(proj, "GET", f"{P}/capacity", None, E, {"user_id": e2["user"]["id"]}), 403)
+check("capacity preview needs user_id", call(proj, "GET", f"{P}/capacity", None, A, {}), 400)
 print("ALL PROJECT TESTS PASSED")

@@ -5,7 +5,10 @@ completion, archiving, and resource allocation.
 Routes (all under /api/projects, all require Authorization: Bearer <token>):
     GET    /                          -> list visible projects with health + budget stats
                                          query: q, status=active|completed, archived=true (admin)
-    GET    /allocation                -> weekly hours per person across active projects (admin, manager)
+    GET    /allocation                -> load per person per week across active projects (admin, manager)
+                                         query: from (snapped to Monday), weeks (default 12, max 26)
+    GET    /capacity                  -> preview before assigning: user_id, hours, from, to, project_id?
+                                         returns the busiest week, what's left, and a per-week breakdown
     GET    /{id}                      -> project detail with members and milestones
     POST   /                          -> create (admin, manager); optional members: [{user_id, hours_per_week,
                                          assigned_from?, assigned_to?}] staffs it in the same request
@@ -333,11 +336,30 @@ def _hide_cost_forecast(p):
 
 # ---------- Allocation ----------
 
-def _overlap_hours(user_id, start, end, exclude_project=None):
-    """Weekly hours a user is already booked for, across active projects, overlapping [start, end]."""
-    row = query_one(
+# ---------- Capacity: hours per week across overlapping assignments ----------
+
+NEAR_CAPACITY = 32.0  # 80% of the week: shown as "approaching capacity"
+
+
+def _monday(d):
+    return d - timedelta(days=d.weekday())
+
+
+def capacity_status(hours):
+    """Traffic light for a week's load: free, ok (within), near (80% or more), over (above the cap)."""
+    if hours > WEEKLY_CAP:
+        return "over"
+    if hours >= NEAR_CAPACITY:
+        return "near"
+    return "ok" if hours > 0 else "free"
+
+
+def _assignments_between(user_id, start, end, exclude_project=None):
+    """Active assignments for one person that touch [start, end], with the project's name and end date."""
+    return query(
         """
-        SELECT COALESCE(SUM(pm.hours_per_week), 0) AS hours
+        SELECT pm.project_id, p.name AS project_name, pm.hours_per_week,
+               pm.assigned_from, COALESCE(pm.assigned_to, p.end_date) AS assigned_to
         FROM project_members pm
         JOIN projects p ON p.id = pm.project_id
         WHERE pm.user_id = %s
@@ -345,10 +367,43 @@ def _overlap_hours(user_id, start, end, exclude_project=None):
           AND (%s::uuid IS NULL OR pm.project_id <> %s::uuid)
           AND pm.assigned_from <= %s
           AND COALESCE(pm.assigned_to, p.end_date) >= %s
+        ORDER BY p.name
         """,
         (user_id, exclude_project, exclude_project, end, start),
     )
-    return float(row["hours"])
+
+
+def weekly_load(assignments, start, end):
+    """Split assignments into Monday-start weeks from `start` to `end`.
+
+    Each week sums the hours of every assignment active during that week, so two projects
+    that overlap add up and two that run back to back do not. Returns one row per week:
+    {week_start, hours, status, assignments: [{project_id, project_name, hours}]}.
+    """
+    weeks = []
+    monday = _monday(start)
+    last = _monday(end)
+    while monday <= last:
+        sunday = monday + timedelta(days=6)
+        active = [a for a in assignments if a["assigned_from"] <= sunday and a["assigned_to"] >= monday]
+        hours = float(sum(float(a["hours_per_week"]) for a in active))
+        weeks.append({
+            "week_start": monday, "hours": hours, "status": capacity_status(hours),
+            "assignments": [{"project_id": a["project_id"], "project_name": a["project_name"],
+                             "hours": float(a["hours_per_week"])} for a in active],
+        })
+        monday += timedelta(days=7)
+    return weeks
+
+
+def _overlap_hours(user_id, start, end, exclude_project=None):
+    """Busiest week for a person between start and end: the most hours they are booked in any one week.
+
+    Assignments on different projects only count against each other in the weeks they actually
+    share, so a person can take 30 h on a project that ends in March and 30 h on one starting in April.
+    """
+    weeks = weekly_load(_assignments_between(user_id, start, end, exclude_project), start, end)
+    return max((w["hours"] for w in weeks), default=0.0)
 
 
 def _check_capacity(user_id, hours, start, end, project_id):
@@ -362,8 +417,21 @@ def _check_capacity(user_id, hours, start, end, project_id):
         )
 
 
-def allocation(viewer):
+def _window(params, default_weeks=12, max_weeks=26):
+    """Week window for the heatmap: `from` (any date, snapped to its Monday) and `weeks`."""
+    start = _monday(_date(params["from"], "from") if params.get("from") else date.today())
+    try:
+        weeks = max(1, min(int(params.get("weeks", default_weeks)), max_weeks))
+    except ValueError:
+        raise ApiError(400, "weeks must be a number")
+    return start, start + timedelta(days=7 * weeks - 1)
+
+
+def allocation(viewer, params=None):
+    """Everyone the viewer manages, with their load for every week in the window (default: 12 weeks from now)."""
     require_role(viewer, "admin", "manager")
+    params = params or {}
+    start, end = _window(params)
     scope, args = "", []
     if viewer["role"] == "manager":
         scope = "AND (u.manager_id = %s OR u.id = %s)"
@@ -371,15 +439,10 @@ def allocation(viewer):
     rows = query(
         f"""
         SELECT u.id, u.name, u.job_title, u.role,
-               COALESCE(SUM(pm.hours_per_week) FILTER (
-                   WHERE p.id IS NOT NULL
-                     AND pm.assigned_from <= CURRENT_DATE
-                     AND COALESCE(pm.assigned_to, p.end_date) >= CURRENT_DATE), 0) AS hours_this_week,
-               COUNT(p.id) AS active_projects,
                COALESCE(json_agg(json_build_object(
                    'project_id', p.id, 'project_name', p.name,
                    'hours_per_week', pm.hours_per_week,
-                   'assigned_from', pm.assigned_from, 'assigned_to', pm.assigned_to))
+                   'assigned_from', pm.assigned_from, 'assigned_to', COALESCE(pm.assigned_to, p.end_date)))
                    FILTER (WHERE p.id IS NOT NULL), '[]') AS assignments
         FROM users u
         LEFT JOIN project_members pm ON pm.user_id = u.id
@@ -387,15 +450,70 @@ def allocation(viewer):
              AND p.is_archived = FALSE AND p.status = 'active'
         WHERE u.is_archived = FALSE {scope}
         GROUP BY u.id
-        ORDER BY hours_this_week DESC, u.name
+        ORDER BY u.name
         """,
         args,
     )
+    this_week = _monday(date.today())
     for r in rows:
-        r["hours_this_week"] = float(r["hours_this_week"])
-        r["available_hours"] = max(WEEKLY_CAP - r["hours_this_week"], 0)
-        r["over_allocated"] = r["hours_this_week"] > WEEKLY_CAP
-    return response(200, {"weekly_cap": WEEKLY_CAP, "people": rows})
+        for a in r["assignments"]:
+            a["assigned_from"] = date.fromisoformat(a["assigned_from"])
+            a["assigned_to"] = date.fromisoformat(a["assigned_to"])
+        weeks = weekly_load(r["assignments"], start, end)
+        now = weekly_load(r["assignments"], this_week, this_week)[0]
+        r["weeks"] = weeks
+        r["hours_this_week"] = now["hours"]
+        r["available_hours"] = max(WEEKLY_CAP - now["hours"], 0)
+        r["over_allocated"] = now["hours"] > WEEKLY_CAP
+        r["peak_hours"] = max((w["hours"] for w in weeks), default=0.0)
+        r["weeks_over"] = sum(1 for w in weeks if w["status"] == "over")
+        r["weeks_near"] = sum(1 for w in weeks if w["status"] == "near")
+        r["active_projects"] = len({a["project_id"] for a in r["assignments"]
+                                    if a["assigned_from"] <= end and a["assigned_to"] >= start})
+    rows.sort(key=lambda r: (-r["peak_hours"], r["name"]))
+    return response(200, {
+        "weekly_cap": WEEKLY_CAP, "near_capacity": NEAR_CAPACITY,
+        "from": start, "to": end, "weeks": [start + timedelta(days=7 * i) for i in range((end - start).days // 7 + 1)],
+        "people": rows,
+    })
+
+
+def capacity(viewer, params):
+    """Preview one person's load before assigning them: would `hours` more per week fit between from and to?
+
+    Managers can ask about their own reports (and themselves); admins about anyone.
+    """
+    require_role(viewer, "admin", "manager")
+    require_fields(params, "user_id")
+    user_id = _uuid(params["user_id"], "user_id")
+    person = query_one("SELECT id, name, manager_id, is_archived FROM users WHERE id = %s", (user_id,))
+    if not person or person["is_archived"]:
+        raise ApiError(404, "User not found")
+    if viewer["role"] == "manager" and str(person["manager_id"]) != str(viewer["id"]) \
+            and str(person["id"]) != str(viewer["id"]):
+        raise ApiError(403, "Managers can only check their own direct reports")
+    start = _date(params["from"], "from") if params.get("from") else date.today()
+    end = _date(params["to"], "to") if params.get("to") else start + timedelta(days=7 * 12 - 1)
+    if end < start:
+        raise ApiError(400, "to must be on or after from")
+    hours = _number(params.get("hours", 0), "hours", 0, WEEKLY_CAP)
+    exclude = _uuid(params["project_id"], "project_id") if params.get("project_id") else None
+    weeks = weekly_load(_assignments_between(user_id, start, end, exclude), start, end)
+    for w in weeks:
+        w["with_new"] = w["hours"] + hours
+        w["status_with_new"] = capacity_status(w["with_new"])
+    peak = max((w["hours"] for w in weeks), default=0.0)
+    worst = max(weeks, key=lambda w: w["hours"]) if weeks else None
+    return response(200, {
+        "user_id": user_id, "name": person["name"], "weekly_cap": WEEKLY_CAP, "near_capacity": NEAR_CAPACITY,
+        "from": start, "to": end, "hours": hours,
+        "booked_peak": peak, "available": max(WEEKLY_CAP - peak, 0),
+        "with_new_peak": peak + hours, "status": capacity_status(peak + hours),
+        "over_by": max(peak + hours - WEEKLY_CAP, 0),
+        "worst_week": worst["week_start"] if worst else None,
+        "weeks_over": sum(1 for w in weeks if w["status_with_new"] == "over"),
+        "weeks": weeks,
+    })
 
 
 # ---------- Project handlers ----------
@@ -766,7 +884,9 @@ def handler(event=None, context=None):
             if method == "POST":
                 return create_project(viewer, body)
         elif parts == ["allocation"] and method == "GET":
-            return allocation(viewer)
+            return allocation(viewer, params)
+        elif parts == ["capacity"] and method == "GET":
+            return capacity(viewer, params)
         elif len(parts) == 3 and parts[0] == "approvals" and method == "POST" and parts[2] in ("approve", "reject", "cancel"):
             req = decide_change_request(viewer, _uuid(parts[1]), parts[2], body, "project", apply_approved_project_change)
             return response(200, {"request": req})

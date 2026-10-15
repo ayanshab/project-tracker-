@@ -1,13 +1,60 @@
 /* eslint-disable react-refresh/only-export-components */
 // Pickers used inside the "new project" and "new milestone" forms, so a manager can
 // staff the work in the same step as creating it instead of a second trip to another tab.
-import { fmtHours } from '../utils/format'
+import { useEffect, useState } from 'react'
+import { api } from '../services/api'
+import { fmtHours, fmtShort } from '../utils/format'
+
+/**
+ * Live capacity check for one person, shown before anything is saved.
+ * Asks the server what their busiest week looks like between from and until, with `hours` added.
+ * projectId excludes the assignment being edited so it isn't counted twice.
+ */
+export function CapacityNote({ userId, hours, from, until, projectId, fallbackFrom, fallbackUntil }) {
+  const [result, setResult] = useState(null) // {key, data | error}
+  const h = Number(hours) || 0
+  const start = from || fallbackFrom || ''
+  const end = until || fallbackUntil || ''
+  const key = `${userId}|${h}|${start}|${end}|${projectId || ''}`
+  const active = Boolean(userId) && h > 0
+  useEffect(() => {
+    if (!active) return undefined
+    let live = true
+    const t = setTimeout(() => {
+      api.get('/projects/capacity', { user_id: userId, hours: h, from: start || undefined, to: end || undefined, project_id: projectId || undefined })
+        .then((d) => live && setResult({ key, data: d }))
+        .catch((e) => live && setResult({ key, error: e.message }))
+    }, 350)
+    return () => { live = false; clearTimeout(t) }
+  }, [active, key, userId, h, start, end, projectId])
+
+  if (!active) return null
+  const state = result && result.key === key ? (result.error ? { error: result.error } : result.data) : { loading: true }
+  if (!state) return null
+  if (state.error) return <div className="cap-note muted" role="status">Couldn't check capacity: {state.error}</div>
+  if (state.loading) return <div className="cap-note muted" role="status">Checking capacity…</div>
+  const { status, booked_peak: peak, with_new_peak: total, over_by: over, worst_week: worst, weekly_cap: cap, weeks_over } = state
+  const period = `${fmtShort(state.from)} to ${fmtShort(state.to)}`
+  if (status === 'over') {
+    return (
+      <div className="cap-note over" role="alert">
+        Over by {fmtHours(over)} a week: already booked {fmtHours(peak)} in the week of {fmtShort(worst)}
+        {weeks_over > 1 ? ` and ${weeks_over - 1} other week${weeks_over > 2 ? 's' : ''}` : ''}.
+        {' '}Reduce to {fmtHours(Math.max(cap - peak, 0))} or change the dates. Saving will be refused.
+      </div>
+    )
+  }
+  if (status === 'near') {
+    return <div className="cap-note near" role="status">Tight: this takes them to {fmtHours(total)} of {cap} in their busiest week ({period}). {fmtHours(cap - total)} would be left.</div>
+  }
+  return <div className="cap-note ok" role="status">Fits: {fmtHours(total)} of {cap} in their busiest week ({period}){peak ? `, ${fmtHours(peak)} of it on other projects` : ''}.</div>
+}
 
 /**
  * Choose people and weekly hours for a new project.
  * people: [{id, name, job_title, hours_this_week}]; value: {userId: hours}; onChange(nextValue)
  */
-export function TeamPicker({ people, value, onChange, loading, later = true, minDate, maxDate }) {
+export function TeamPicker({ people, value, onChange, loading, later = true, minDate, maxDate, projectId }) {
   const toggle = (p) => {
     const next = { ...value }
     if (p.id in next) delete next[p.id]
@@ -49,6 +96,7 @@ export function TeamPicker({ people, value, onChange, loading, later = true, min
                       <span className="muted small">Until</span>
                       <input type="date" min={value[p.id].from || minDate} max={maxDate} value={value[p.id].until} onChange={(e) => set(p.id, { until: e.target.value })} aria-label={`End date for ${p.name}`} />
                     </label>
+                    <CapacityNote userId={p.id} hours={value[p.id].hours} from={value[p.id].from} until={value[p.id].until} projectId={projectId} fallbackFrom={minDate} fallbackUntil={maxDate} />
                   </div>
                 )}
               </li>
@@ -56,7 +104,7 @@ export function TeamPicker({ people, value, onChange, loading, later = true, min
           })}
         </ul>
       ) : <p className="muted small">No one is available to add yet.</p>}
-      <span className="field-hint">Free hours are as of this week. Nobody can go over 40 hours a week across projects. Leave From empty to start today (or at the project start), and Until empty to stay to the end.{later && ' You can change the team later on the Team tab.'}</span>
+      <span className="field-hint">Free hours are as of this week. Nobody can go over 40 hours a week across projects, and the note under each chosen person checks their busiest week in the period before you save. Leave From empty to start today (or at the project start), and Until empty to stay to the end.{later && ' You can change the team later on the Team tab.'}</span>
     </fieldset>
   )
 }

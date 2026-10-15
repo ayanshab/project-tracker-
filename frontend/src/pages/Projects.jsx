@@ -71,6 +71,7 @@ export function ProjectForm({ project, onClose, onSaved }) {
 
   // Starting team, chosen in the same form (new projects only).
   const [team, setTeam] = useState({})
+  const [dates, setDates] = useState({ start: project?.start_date || todayISO(), end: project?.end_date || '' })
   const people = useApi(
     () => (editing ? Promise.resolve([]) : api.get('/projects/allocation').then((d) => d.people.filter((p) => user.role !== 'admin' || p.role !== 'admin'))),
     [],
@@ -96,8 +97,8 @@ export function ProjectForm({ project, onClose, onSaved }) {
     <FormModal title={editing ? 'Edit project' : 'New project'} submitLabel={editing ? 'Save project' : 'Create project'} onSubmit={submit} onClose={onClose}>
       <Field label="Name" wide><input name="name" required maxLength={200} defaultValue={project?.name} /></Field>
       <Field label="Description" wide><textarea name="description" rows={3} maxLength={2000} defaultValue={project?.description || ''} /></Field>
-      <Field label="Start date"><input name="start_date" type="date" required defaultValue={project?.start_date || todayISO()} /></Field>
-      <Field label="End date"><input name="end_date" type="date" required defaultValue={project?.end_date} /></Field>
+      <Field label="Start date"><input name="start_date" type="date" required value={dates.start} onChange={(e) => setDates((d) => ({ ...d, start: e.target.value }))} /></Field>
+      <Field label="End date"><input name="end_date" type="date" required min={dates.start} value={dates.end} onChange={(e) => setDates((d) => ({ ...d, end: e.target.value }))} /></Field>
       <Field label="Budgeted hours" hint="Total effort planned"><input name="budget_hours" type="number" min="0" step="1" defaultValue={project?.budget_hours ?? ''} /></Field>
       <Field label="Planned budget (USD)" hint="Labor plus other costs"><input name="planned_budget" type="number" min="0" step="100" defaultValue={project?.planned_budget ?? ''} /></Field>
       {editing && (
@@ -115,7 +116,7 @@ export function ProjectForm({ project, onClose, onSaved }) {
           )}
         </Field>
       )}
-      {!editing && <TeamPicker people={people.data || []} loading={people.loading} value={team} onChange={setTeam} />}
+      {!editing && <TeamPicker people={people.data || []} loading={people.loading} value={team} onChange={setTeam} minDate={dates.start} maxDate={dates.end || undefined} />}
     </FormModal>
   )
 }
