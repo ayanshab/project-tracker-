@@ -136,15 +136,24 @@ export function ErrorNote({ error, onRetry }) {
   )
 }
 
-export function PageHeader({ title, subtitle, actions }) {
+/** The dark band at the top of every page: crumbs, title, subtitle, tags, actions.
+ *  A `.stats` strip placed right after it overlaps its lower edge. */
+export function PageHeader({ title, subtitle, actions, crumbs, tags, meta }) {
   return (
-    <div className="page-head">
-      <div>
-        <h1>{title}</h1>
-        {subtitle && <p className="page-sub">{subtitle}</p>}
+    <header className="band">
+      <div className="band-in">
+        {crumbs && <div className="crumbs">{crumbs}</div>}
+        <div className="page-head">
+          <div>
+            <h1>{title}</h1>
+            {tags && <div className="row-tags band-tags">{tags}</div>}
+            {subtitle && <p className="page-sub">{subtitle}</p>}
+            {meta && <p className="page-meta">{meta}</p>}
+          </div>
+          {actions && <div className="page-actions">{actions}</div>}
+        </div>
       </div>
-      {actions && <div className="page-actions">{actions}</div>}
-    </div>
+    </header>
   )
 }
 

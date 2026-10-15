@@ -51,7 +51,7 @@ export function Brand() {
 }
 
 export default function Layout() {
-  const { user, logout } = useAuth()
+  const { user } = useAuth()
   const isPhone = useMediaQuery({ maxWidth: 820 })
   const items = NAV[user.role] || NAV.employee
   const { pathname } = useLocation()
@@ -83,20 +83,19 @@ export default function Layout() {
 
   return (
     <div className="shell">
-      <aside className="sidebar">
-        <Brand />
-        <nav className="side-nav" aria-label="Main">{links}</nav>
-        <div className="side-foot">
+      <header className="topnav">
+        <div className="topnav-in">
+          <Brand />
+          <nav className="top-links" aria-label="Main">{links}</nav>
           <NavLink to="/profile" className={({ isActive }) => `me ${isActive ? 'active' : ''}`}>
-            <Avatar name={user.name} />
             <span className="me-text">
               <span className="me-name">{user.name}</span>
-              <span className="me-role">{ROLE_LABEL[user.role]}, ID {user.employee_number}</span>
+              <span className="me-role">{ROLE_LABEL[user.role]} · {user.employee_number}</span>
             </span>
+            <Avatar name={user.name} size={34} />
           </NavLink>
-          <button className="link-btn" onClick={logout}>Sign out</button>
         </div>
-      </aside>
+      </header>
       <main className="content"><Outlet /></main>
     </div>
   )

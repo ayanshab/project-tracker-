@@ -2,7 +2,7 @@ import { Link } from 'react-router-dom'
 import { api } from '../services/api'
 import { Empty, ErrorNote, Loading, PageHeader, Panel, Tag, useApi } from '../components/ui'
 
-const PALETTE = ['#2350D8', '#1F8A5B', '#8A4FD8', '#C77C02', '#0E8A9C', '#C2362F', '#5B6676']
+const PALETTE = ['#0F6B4F', '#B48A4E', '#2F5D8A', '#7A4E8C', '#1E7F8C', '#8C5A2B', '#5B6676']
 
 export default function Allocation() {
   const { data, error, loading, reload } = useApi(() => api.get('/projects/allocation'), [])

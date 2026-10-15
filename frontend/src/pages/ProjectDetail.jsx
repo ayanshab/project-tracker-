@@ -3,7 +3,7 @@ import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { api } from '../services/api'
 import { useAuth } from '../context/AuthContext'
 import {
-  Button, Empty, ErrorNote, Field, FormModal, Loading, Panel, Progress, Stat, Tag,
+  Button, Empty, ErrorNote, Field, FormModal, Loading, PageHeader, Panel, Progress, Stat, Tag,
   formToObject, useAction, useApi, useToast,
 } from '../components/ui'
 import MilestoneLine from '../components/MilestoneLine'
@@ -44,21 +44,21 @@ export default function ProjectDetail() {
 
   return (
     <>
-      <div className="crumbs"><Link to={p.is_archived ? '/archive' : '/projects'}>{p.is_archived ? 'Archive' : 'Projects'}</Link></div>
-      <div className="page-head">
-        <div>
-          <h1>{p.name}</h1>
-          <div className="row-tags"><RiskTags project={p} /></div>
-          {p.description && <p className="page-sub">{p.description}</p>}
-          <p className="muted">Managed by {p.manager_name}. Runs {fmtDate(p.start_date)} to {fmtDate(p.end_date)}.</p>
-        </div>
-        <div className="page-actions">
-          {manage && <Button variant="ghost" onClick={() => setEditing(true)}>Edit project</Button>}
-          {manage && <Button onClick={complete}>Mark complete</Button>}
-          {isAdmin && !p.is_archived && p.status === 'active' && <Button variant="ghost" onClick={() => window.confirm('Archive this project? Its team and history are kept.') && archive(true)}>Archive</Button>}
-          {isAdmin && p.is_archived && <Button onClick={() => archive(false)}>Restore from archive</Button>}
-        </div>
-      </div>
+      <PageHeader
+        crumbs={<Link to={p.is_archived ? '/archive' : '/projects'}>{p.is_archived ? 'Archive' : 'Projects'}</Link>}
+        title={p.name}
+        tags={<RiskTags project={p} />}
+        subtitle={p.description}
+        meta={`Managed by ${p.manager_name}. Runs ${fmtDate(p.start_date)} to ${fmtDate(p.end_date)}.`}
+        actions={(manage || isAdmin) && (
+          <>
+            {manage && <Button variant="ghost" onClick={() => setEditing(true)}>Edit project</Button>}
+            {manage && <Button onClick={complete}>Mark complete</Button>}
+            {isAdmin && !p.is_archived && p.status === 'active' && <Button variant="ghost" onClick={() => window.confirm('Archive this project? Its team and history are kept.') && archive(true)}>Archive</Button>}
+            {isAdmin && p.is_archived && <Button onClick={() => archive(false)}>Restore from archive</Button>}
+          </>
+        )}
+      />
 
       <div className="stats">
         <Stat label="Milestones done" value={`${p.milestones_completed} / ${p.milestones_total}`} sub={`${p.time_elapsed_pct}% of the schedule has passed`} />
