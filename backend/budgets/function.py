@@ -5,7 +5,8 @@ Routes (all under /api/budgets, all require Authorization: Bearer <token>):
     GET    /time                  -> time entries; query: project_id, user_id, from, to
     GET    /time/week             -> the caller's hours this week (or ?week_of=YYYY-MM-DD)
     POST   /time                  -> log own time {project_id, hours, work_date?, milestone_id?, note?}
-    DELETE /time/{id}             -> delete own entry (admins: any entry)
+    PATCH  /time/{id}             -> correct own entry {work_date?, hours?, milestone_id?, note?} while its week is open
+    DELETE /time/{id}             -> delete own entry while its week is open (admins: any entry, any time)
     GET    /costs?project_id=...  -> other costs for a project (manager, admin)
     POST   /costs                 -> add {project_id, category, amount, description?, incurred_on?}
     DELETE /costs/{id}            -> remove a cost (manager, admin)
@@ -18,6 +19,8 @@ Rules:
     - People log time only for projects they are assigned to, on dates within their assignment.
     - No logging in the future or against completed/archived projects.
     - Labor cost = hours x the employee's pay rate. Pay details are hidden from employees.
+    - Timesheets close after one week: people can correct or delete entries from this week and
+      last week only. Older corrections go through an admin, and every change is audited.
 """
 
 import logging
@@ -88,18 +91,15 @@ def _project(viewer, project_id, manage=False):
 
 # ---------- Time entries ----------
 
-def log_time(viewer, body):
-    require_fields(body, "project_id", "hours")
-    project, _ = _project(viewer, body["project_id"])
+def _check_entry(viewer, project, work_date, hours, milestone_id, exclude_entry=None):
+    """Every rule a time entry must meet, for a new entry or an edit. Writes nothing.
+    exclude_entry: the entry being edited, so its current hours don't count against the caps."""
     if project["status"] != "active" or project["is_archived"]:
         raise ApiError(409, "Time can only be logged on active projects")
-    hours = _amount(body["hours"], "hours", 0.25, DAILY_CAP)
-    work_date = _date(body["work_date"], "work_date") if body.get("work_date") else date.today()
     if work_date > date.today():
         raise ApiError(400, "You cannot log time in the future")
     if work_date < project["start_date"] or work_date > project["end_date"]:
         raise ApiError(400, "work_date must fall within the project dates")
-
     assignment = query_one(
         "SELECT * FROM project_members WHERE project_id = %s AND user_id = %s", (project["id"], viewer["id"])
     )
@@ -107,19 +107,16 @@ def log_time(viewer, body):
         raise ApiError(403, "You can only log time on projects you are assigned to")
     if work_date < assignment["assigned_from"] or (assignment["assigned_to"] and work_date > assignment["assigned_to"]):
         raise ApiError(400, "That date is outside your assignment on this project")
-
-    milestone_id = None
-    if body.get("milestone_id"):
-        milestone_id = _uuid(body["milestone_id"], "milestone_id")
+    if milestone_id:
         ms = query_one("SELECT project_id, status FROM milestones WHERE id = %s", (milestone_id,))
         if not ms or str(ms["project_id"]) != str(project["id"]):
             raise ApiError(400, "That milestone does not belong to this project")
         if ms["status"] == "pending":
             raise ApiError(409, "That milestone has not started yet")
-
+    skip = exclude_entry or "00000000-0000-0000-0000-000000000000"
     day_total = float(query_one(
-        "SELECT COALESCE(SUM(hours), 0) AS h FROM time_entries WHERE user_id = %s AND work_date = %s",
-        (viewer["id"], work_date),
+        "SELECT COALESCE(SUM(hours), 0) AS h FROM time_entries WHERE user_id = %s AND work_date = %s AND id <> %s",
+        (viewer["id"], work_date, skip),
     )["h"])
     if day_total + hours > DAILY_CAP:
         raise ApiError(
@@ -129,8 +126,9 @@ def log_time(viewer, body):
         )
     monday, sunday = _week_bounds(work_date)
     week_total = float(query_one(
-        "SELECT COALESCE(SUM(hours), 0) AS h FROM time_entries WHERE user_id = %s AND work_date BETWEEN %s AND %s",
-        (viewer["id"], monday, sunday),
+        "SELECT COALESCE(SUM(hours), 0) AS h FROM time_entries "
+        "WHERE user_id = %s AND work_date BETWEEN %s AND %s AND id <> %s",
+        (viewer["id"], monday, sunday, skip),
     )["h"])
     if week_total + hours > WEEKLY_CAP:
         raise ApiError(
@@ -138,7 +136,23 @@ def log_time(viewer, body):
             f"You already logged {week_total:g} h the week of {monday}. The weekly limit is {WEEKLY_CAP:g} h "
             f"({WEEKLY_CAP - week_total:g} h left).",
         )
+    return day_total, week_total
 
+
+def _timesheet_open_from():
+    """Timesheets close like a payroll week: only the current and the previous
+    Monday-to-Sunday weeks can be corrected. Older entries are locked."""
+    monday, _ = _week_bounds(date.today())
+    return monday - timedelta(days=7)
+
+
+def log_time(viewer, body):
+    require_fields(body, "project_id", "hours")
+    project, _ = _project(viewer, body["project_id"])
+    hours = _amount(body["hours"], "hours", 0.25, DAILY_CAP)
+    work_date = _date(body["work_date"], "work_date") if body.get("work_date") else date.today()
+    milestone_id = _uuid(body["milestone_id"], "milestone_id") if body.get("milestone_id") else None
+    day_total, week_total = _check_entry(viewer, project, work_date, hours, milestone_id)
     row = execute(
         "INSERT INTO time_entries (user_id, project_id, milestone_id, work_date, hours, note) "
         "VALUES (%s, %s, %s, %s, %s, %s) RETURNING *",
@@ -147,6 +161,50 @@ def log_time(viewer, body):
     audit(viewer, "time.log", "project", project["id"], project["name"],
           {"entry_id": row["id"], "work_date": work_date, "hours": hours, "milestone_id": milestone_id})
     return response(201, {"entry": row, "day_total": day_total + hours, "week_total": week_total + hours})
+
+
+EDITABLE_TIME_FIELDS = ("work_date", "hours", "milestone_id", "note")
+
+
+def edit_time(viewer, entry_id, body):
+    """Correct one of your own entries. Limits:
+    - only the person who logged it (not managers, not admins: nobody edits someone else's timesheet);
+    - only while its timesheet week is open (this week or last week), and the new date must be too;
+    - the project can't change (delete and re-log instead, so each project's cost history stays clean);
+    - every logging rule applies again: caps, assignment dates, no future dates, started milestones;
+    - the change is audited with the old and new values."""
+    entry = query_one("SELECT * FROM time_entries WHERE id = %s", (_uuid(entry_id),))
+    if not entry:
+        raise ApiError(404, "Time entry not found")
+    if str(entry["user_id"]) != str(viewer["id"]):
+        raise ApiError(403, "You can only edit your own time entries")
+    if "project_id" in body and str(body["project_id"]) != str(entry["project_id"]):
+        raise ApiError(400, "The project of an entry can't be changed. Delete it and log the time on the right project.")
+    fields = [k for k in EDITABLE_TIME_FIELDS if k in body]
+    if not fields:
+        raise ApiError(400, "No editable fields provided")
+    open_from = _timesheet_open_from()
+    if entry["work_date"] < open_from:
+        raise ApiError(409, f"Timesheets before {open_from} are closed. Ask an admin to correct this entry.")
+    project = query_one("SELECT * FROM projects WHERE id = %s", (entry["project_id"],))
+    work_date = _date(body["work_date"], "work_date") if "work_date" in body else entry["work_date"]
+    if work_date < open_from:
+        raise ApiError(409, f"Entries can only be moved to dates from {open_from} on, while the timesheet is open.")
+    hours = _amount(body["hours"], "hours", 0.25, DAILY_CAP) if "hours" in body else float(entry["hours"])
+    if "milestone_id" in body:
+        milestone_id = _uuid(body["milestone_id"], "milestone_id") if body["milestone_id"] else None
+    else:
+        milestone_id = str(entry["milestone_id"]) if entry["milestone_id"] else None
+    note = ((body.get("note") or "").strip()[:500] or None) if "note" in body else entry["note"]
+    _check_entry(viewer, project, work_date, hours, milestone_id, exclude_entry=entry["id"])
+    after = execute(
+        "UPDATE time_entries SET work_date = %s, hours = %s, milestone_id = %s, note = %s WHERE id = %s RETURNING *",
+        (work_date, hours, milestone_id, note, entry["id"]),
+    )
+    diff = {k: [entry[k], after[k]] for k in EDITABLE_TIME_FIELDS if str(entry[k]) != str(after[k])}
+    if diff:
+        audit(viewer, "time.edit", "project", project["id"], project["name"], {"entry_id": entry["id"], "changes": diff})
+    return response(200, {"entry": after})
 
 
 def list_time(viewer, params):
@@ -183,7 +241,11 @@ def list_time(viewer, params):
         """,
         args,
     )
-    return response(200, {"entries": rows, "total_hours": round(sum(float(r["hours"]) for r in rows), 2)})
+    open_from = _timesheet_open_from()
+    for r in rows:
+        r["editable"] = str(r["user_id"]) == str(viewer["id"]) and r["work_date"] >= open_from
+    return response(200, {"entries": rows, "total_hours": round(sum(float(r["hours"]) for r in rows), 2),
+                          "timesheet_open_from": open_from})
 
 
 def my_week(viewer, params):
@@ -226,6 +288,9 @@ def delete_time(viewer, entry_id):
         raise ApiError(404, "Time entry not found")
     if viewer["role"] != "admin" and str(entry["user_id"]) != str(viewer["id"]):
         raise ApiError(403, "You can only delete your own time entries")
+    open_from = _timesheet_open_from()
+    if viewer["role"] != "admin" and entry["work_date"] < open_from:
+        raise ApiError(409, f"Timesheets before {open_from} are closed. Ask an admin to correct this entry.")
     execute("DELETE FROM time_entries WHERE id = %s", (entry["id"],))
     audit(viewer, "time.delete", "project", entry["project_id"], None,
           {"entry_id": entry["id"], "owner_id": entry["user_id"], "work_date": entry["work_date"], "hours": entry["hours"]})
@@ -427,6 +492,8 @@ def handler(event=None, context=None):
             return my_week(viewer, params)
         elif len(parts) == 2 and parts[0] == "time" and method == "DELETE":
             return delete_time(viewer, parts[1])
+        elif len(parts) == 2 and parts[0] == "time" and method in ("PATCH", "PUT"):
+            return edit_time(viewer, parts[1], body)
         elif parts == ["costs"]:
             if method == "GET":
                 return list_costs(viewer, params)

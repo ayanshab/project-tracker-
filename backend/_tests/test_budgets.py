@@ -28,6 +28,7 @@ def check(label, got, want):
 tag = uuid.uuid4().hex[:6]
 today = date.today(); last_mon = today - timedelta(days=today.weekday() + 7)
 d = lambda n: (last_mon + timedelta(days=n)).isoformat()
+import db as bud_db  # the same shared helper the services use
 A = call(auth, "POST", "/api/auth/login", {"username": "admin", "password": "Admin123!"})[1]["token"]
 mk = lambda n, r, mgr=None, pay=50: call(users, "POST", "/api/users", {"name": n, "email": f"{n.lower()}.{tag}@t.com", "role": r, "manager_id": mgr, "pay_rate": pay}, A)[1]
 def first_login(username, temp_password, ip=None):
@@ -72,6 +73,28 @@ check("employee portfolio forbidden", call(bud, "GET", "/api/budgets/portfolio",
 s, b = call(bud, "GET", T, None, E1); eid = b["entries"][0]["id"]
 check("Ben cannot delete Ann's entry", call(bud, "DELETE", f"{T}/{eid}", None, E2), 403)
 check("Ann deletes own entry", call(bud, "DELETE", f"{T}/{eid}", None, E1), 200)
+# Editing time: own entries only, open timesheet weeks only, every logging rule again
+s, b = call(bud, "GET", T, None, E1)
+assert all(x["editable"] for x in b["entries"]); print("PASS last week's entries are editable")
+e = next(x for x in b["entries"] if x["work_date"] == d(1))
+check("Ben cannot edit Ann's entry", call(bud, "PATCH", f"{T}/{e['id']}", {"hours": 1}, E2), 403)
+check("manager cannot edit Ann's entry", call(bud, "PATCH", f"{T}/{e['id']}", {"hours": 1}, M), 403)
+check("admin cannot edit Ann's entry", call(bud, "PATCH", f"{T}/{e['id']}", {"hours": 1}, A), 403)
+check("edit over 8h rejected", call(bud, "PATCH", f"{T}/{e['id']}", {"hours": 9}, E1), 400)
+check("moving to another project rejected", call(bud, "PATCH", f"{T}/{e['id']}", {"project_id": q["id"]}, E1), 400)
+check("moving to the future rejected", call(bud, "PATCH", f"{T}/{e['id']}", {"work_date": (today + timedelta(days=1)).isoformat()}, E1), 400)
+r = check("moving onto a full day rejected", call(bud, "PATCH", f"{T}/{e['id']}", {"work_date": d(0)}, E1), 409); print("   ", r["error"])
+r = check("Ann corrects 8h to 7.5h with a note", call(bud, "PATCH", f"{T}/{e['id']}", {"hours": 7.5, "note": "left early"}, E1), 200)
+assert float(r["entry"]["hours"]) == 7.5; print("PASS edit saved")
+check("editing to the same hours passes its own cap", call(bud, "PATCH", f"{T}/{e['id']}", {"hours": 7.5}, E1), 200)
+old_day = (last_mon - timedelta(days=14)).isoformat()
+oid = bud_db.execute("INSERT INTO time_entries (user_id, project_id, hours, work_date) VALUES (%s, %s, 2, %s) RETURNING id",
+                     (e1["user"]["id"], p["id"], old_day))["id"]
+r = check("closed-week entry cannot be edited", call(bud, "PATCH", f"{T}/{oid}", {"hours": 1}, E1), 409); print("   ", r["error"])
+check("closed-week entry cannot be deleted by its owner", call(bud, "DELETE", f"{T}/{oid}", None, E1), 409)
+check("entry cannot be moved into a closed week", call(bud, "PATCH", f"{T}/{e['id']}", {"work_date": old_day}, E1), 409)
+check("admin can still remove a closed-week entry", call(bud, "DELETE", f"{T}/{oid}", None, A), 200)
+assert bud_db.query_one("SELECT 1 AS x FROM audit_log WHERE action = 'time.edit' AND details->>'entry_id' = %s", (str(e["id"]),)); print("PASS time edits are audited")
 check("delete cost", call(bud, "DELETE", f"/api/budgets/costs/{c['id']}", None, M), 200)
 s, b = call(proj, "GET", f"/api/projects/{p['id']}", None, M); print("    project card: hours_logged", b["project"]["hours_logged"], "total_cost", b["project"]["total_cost"], "at_risk", b["project"]["at_risk"], b["project"]["risk_reasons"])
 print("ALL BUDGET TESTS PASSED")

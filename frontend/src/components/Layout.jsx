@@ -36,14 +36,14 @@ const NAV = {
   ],
 }
 
-function Brand() {
+export function Brand() {
   return (
     <div className="brand">
       <svg width="26" height="26" viewBox="0 0 26 26" aria-hidden="true">
         <line x1="3" y1="13" x2="23" y2="13" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" />
         <circle cx="5" cy="13" r="3.5" fill="currentColor" />
-        <circle cx="13" cy="13" r="3.5" fill="var(--surface)" stroke="currentColor" strokeWidth="2.2" />
-        <circle cx="21" cy="13" r="3.5" fill="var(--surface)" stroke="currentColor" strokeWidth="2.2" />
+        <circle cx="13" cy="13" r="3.5" fill="var(--brand-bg, var(--surface))" stroke="currentColor" strokeWidth="2.2" />
+        <circle cx="21" cy="13" r="3.5" fill="var(--brand-bg, var(--surface))" stroke="currentColor" strokeWidth="2.2" />
       </svg>
       <span>ACME Tracker</span>
     </div>

@@ -505,6 +505,8 @@ def update_task(viewer, task_id, body):
     if manager_fields:
         if not can_manage:
             raise ApiError(403, "Only the project's manager or an admin can edit task details")
+        if ms["status"] == "completed":
+            raise ApiError(409, "Tasks on a completed milestone can't be changed. Reopen the milestone first.")
         if "title" in body:
             sets.append("title = %s"); args.append(_text(body["title"], "title"))
         if "description" in body:

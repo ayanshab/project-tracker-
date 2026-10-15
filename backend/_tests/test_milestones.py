@@ -58,6 +58,11 @@ check("task assigned to non-member rejected", call(mil, "POST", f"{P}/{m1['id']}
 d = check("add task for Ann", call(mil, "POST", f"{P}/{m1['id']}/tasks", {"title": "Wireframes", "assigned_to": e1["user"]["id"]}, M), 201)["milestone"]
 d = check("add unassigned task", call(mil, "POST", f"{P}/{m1['id']}/tasks", {"title": "Style guide"}, M), 201)["milestone"]
 t_ann = next(t for t in d["tasks"] if t["title"] == "Wireframes"); t_open = next(t for t in d["tasks"] if t["title"] == "Style guide")
+check("employee cannot rename a task", call(mil, "PATCH", f"{P}/tasks/{t_open['id']}", {"title": "x"}, E1), 403)
+r = check("manager renames and reassigns a task", call(mil, "PATCH", f"{P}/tasks/{t_open['id']}", {"title": "Style guide v2", "assigned_to": e2["user"]["id"]}, M), 200)
+tt = next(t for t in r["milestone"]["tasks"] if t["id"] == t_open["id"]); assert tt["title"] == "Style guide v2" and tt["assigned_to_name"] == "Ben"; print("PASS task renamed and reassigned")
+check("task cannot go to someone off the milestone", call(mil, "PATCH", f"{P}/tasks/{t_open['id']}", {"assigned_to": out["user"]["id"]}, M), 400)
+check("task back to anyone on the milestone", call(mil, "PATCH", f"{P}/tasks/{t_open['id']}", {"assigned_to": None, "title": "Style guide"}, M), 200)
 check("cannot check off before milestone starts", call(mil, "PATCH", f"{P}/tasks/{t_ann['id']}", {"completed": True}, E1), 409)
 check("start M1", call(mil, "POST", f"{P}/{m1['id']}/start", None, M), 200)
 mine = check("Ann's open milestones", call(mil, "GET", f"{P}/mine", None, E1), 200)

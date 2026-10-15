@@ -10,7 +10,7 @@ import MilestoneLine from '../components/MilestoneLine'
 import { RiskTags } from '../components/ProjectRow'
 import { ProjectForm } from './Projects'
 import Forecast from '../components/Forecast'
-import { MilestonePeoplePicker, TaskRows, TeamPicker } from '../components/Pickers'
+import { MilestonePeoplePicker, TaskRows, TeamPicker, toAssignments } from '../components/Pickers'
 import { ChangeList, decidePath } from './Approvals'
 import { BUDGET_STATUS, MILESTONE_STATUS, fmtDate, fmtHours, fmtMoney, fmtPct, fmtShort, todayISO } from '../utils/format'
 
@@ -265,14 +265,7 @@ function MilestoneDetail({ id, project, milestones = [], manage, onChanged, onSe
           {m.tasks.length ? (
             <ul className="checklist">
               {m.tasks.map((t) => (
-                <li key={t.id}>
-                  <label className={t.completed ? 'done' : ''}>
-                    <input type="checkbox" checked={t.completed} disabled={!canCheck(t)} onChange={() => run(() => api.patch(`/milestones/tasks/${t.id}`, { completed: !t.completed }))} />
-                    <span>{t.title}</span>
-                  </label>
-                  <span className="muted small">{t.assigned_to_name || 'Anyone on the milestone'}</span>
-                  {manage && <button className="icon-btn" aria-label={`Delete task ${t.title}`} onClick={() => run(() => api.del(`/milestones/tasks/${t.id}`), 'Task deleted')}>×</button>}
-                </li>
+                <TaskItem key={t.id} task={t} milestone={m} canCheck={canCheck(t)} editable={manage && m.status !== 'completed'} run={run} />
               ))}
             </ul>
           ) : <p className="muted">No tasks yet.</p>}
@@ -301,6 +294,45 @@ function MilestoneDetail({ id, project, milestones = [], manage, onChanged, onSe
       {editing && <MilestoneForm project={project} milestone={m} onClose={() => setEditing(false)} onSaved={() => { setEditing(false); refresh() }} />}
       {addingMember && <AddMilestoneMember project={project} milestone={m} milestones={milestones} onClose={() => setAddingMember(false)} onSaved={() => { setAddingMember(false); refresh() }} />}
     </Panel>
+  )
+}
+
+function TaskItem({ task: t, milestone, canCheck, editable, run }) {
+  const [editing, setEditing] = useState(false)
+  const [title, setTitle] = useState(t.title)
+  const [assignee, setAssignee] = useState(t.assigned_to || '')
+  const save = async (e) => {
+    e.preventDefault()
+    if (!title.trim()) return
+    const ok = await run(() => api.patch(`/milestones/tasks/${t.id}`, { title: title.trim(), assigned_to: assignee || null }), 'Task updated')
+    if (ok !== false) setEditing(false)
+  }
+  if (editing) {
+    return (
+      <li className="task-editing">
+        <form className="inline-form" onSubmit={save}>
+          <input value={title} onChange={(e) => setTitle(e.target.value)} aria-label="Task title" maxLength={200} autoFocus
+            onKeyDown={(e) => e.key === 'Escape' && setEditing(false)} />
+          <select value={assignee} onChange={(e) => setAssignee(e.target.value)} aria-label="Assign to">
+            <option value="">Anyone on the milestone</option>
+            {milestone.members.map((x) => <option key={x.user_id} value={x.user_id}>{x.name}</option>)}
+          </select>
+          <Button size="sm" type="submit">Save</Button>
+          <Button size="sm" variant="ghost" type="button" onClick={() => { setEditing(false); setTitle(t.title); setAssignee(t.assigned_to || '') }}>Cancel</Button>
+        </form>
+      </li>
+    )
+  }
+  return (
+    <li>
+      <label className={t.completed ? 'done' : ''}>
+        <input type="checkbox" checked={t.completed} disabled={!canCheck} onChange={() => run(() => api.patch(`/milestones/tasks/${t.id}`, { completed: !t.completed }))} />
+        <span>{t.title}</span>
+      </label>
+      <span className="muted small">{t.assigned_to_name || 'Anyone on the milestone'}</span>
+      {editable && <button className="link-btn" onClick={() => setEditing(true)} aria-label={`Edit task ${t.title}`}>Edit</button>}
+      {editable && <button className="icon-btn" aria-label={`Delete task ${t.title}`} onClick={() => window.confirm(`Delete the task "${t.title}"?`) && run(() => api.del(`/milestones/tasks/${t.id}`), 'Task deleted')}>×</button>}
+    </li>
   )
 }
 
@@ -407,15 +439,15 @@ function AddPeople({ project, onClose, onSaved }) {
   const people = useApi(() => api.get('/projects/allocation').then((d) => d.people.filter(
     (u) => (user.role !== 'admin' || u.role !== 'admin') && !project.members.some((x) => x.user_id === u.id))), [])
   const submit = async () => {
-    const ids = Object.keys(team)
-    if (!ids.length) throw new Error('Choose at least one person.')
-    await addEach(ids, (id) => api.post(`/projects/${project.id}/members`, { user_id: id, hours_per_week: Number(team[id]) }),
+    const rows = toAssignments(team)
+    if (!rows.length) throw new Error('Choose at least one person.')
+    const byId = Object.fromEntries(rows.map((r) => [r.user_id, r]))
+    await addEach(rows.map((r) => r.user_id), (id) => api.post(`/projects/${project.id}/members`, byId[id]),
       (id) => people.data?.find((u) => u.id === id)?.name, onSaved)
   }
   return (
     <FormModal title="Add people to the project" submitLabel="Add to project" onClose={onClose} onSubmit={submit}>
-      <TeamPicker people={people.data || []} loading={people.loading} value={team} onChange={setTeam} later={false} />
-      <p className="muted small field-wide">They start today, or on the project start date if that is later, and stay until the project ends. Use "Change hours or dates" to adjust.</p>
+      <TeamPicker people={people.data || []} loading={people.loading} value={team} onChange={setTeam} later={false} minDate={project.start_date} maxDate={project.end_date} />
     </FormModal>
   )
 }

@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { useAuth } from '../context/AuthContext'
 import { Button, ErrorNote } from '../components/ui'
+import { Brand } from '../components/Layout'
 
 export default function Login() {
   const { login } = useAuth()
@@ -22,15 +23,20 @@ export default function Login() {
 
   return (
     <div className="login">
-      <div className="login-art" aria-hidden="true">
-        <svg viewBox="0 0 400 120" preserveAspectRatio="xMidYMid meet">
-          <line x1="20" y1="60" x2="380" y2="60" className="art-track" />
-          <line x1="20" y1="60" x2="200" y2="60" className="art-done" />
-          {[20, 110, 200, 290, 380].map((x, i) => (
-            <circle key={x} cx={x} cy="60" r="11" className={i < 2 ? 'art-stop done' : i === 2 ? 'art-stop now' : 'art-stop'} />
-          ))}
-        </svg>
-        <p>Every project, one stop at a time.</p>
+      <div className="login-art">
+        <Brand />
+        <div className="login-art-body">
+          <h2>Every project, every hour, accounted for.</h2>
+          <p>Plan milestones, staff teams within a 40-hour week, and track spend against budget, with every change approved and on the record.</p>
+          <svg viewBox="0 0 400 60" preserveAspectRatio="xMinYMid meet" aria-hidden="true">
+            <line x1="12" y1="30" x2="388" y2="30" className="art-track" />
+            <line x1="12" y1="30" x2="200" y2="30" className="art-done" />
+            {[12, 106, 200, 294, 388].map((x, i) => (
+              <circle key={x} cx={x} cy="30" r="9" className={i < 2 ? 'art-stop done' : i === 2 ? 'art-stop now' : 'art-stop'} />
+            ))}
+          </svg>
+        </div>
+        <p className="login-foot">Access is limited to authorized ACME staff. Sign-ins and changes are recorded.</p>
       </div>
       <form className="login-card" onSubmit={submit}>
         <h1>Sign in</h1>

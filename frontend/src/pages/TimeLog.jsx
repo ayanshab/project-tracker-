@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { api } from '../services/api'
 import { useAuth } from '../context/AuthContext'
-import { Button, Empty, ErrorNote, Field, Loading, PageHeader, Panel, formToObject, useAction, useApi } from '../components/ui'
+import { Button, Empty, ErrorNote, Field, FormModal, Loading, PageHeader, Panel, Tag, formToObject, useAction, useApi, useToast } from '../components/ui'
 import { fmtHours, fmtShort, fmtWeekday, todayISO } from '../utils/format'
 
 export default function TimeLog() {
@@ -9,9 +9,11 @@ export default function TimeLog() {
   const act = useAction()
   const [projectId, setProjectId] = useState('')
   const [busy, setBusy] = useState(false)
+  const [editing, setEditing] = useState(null)
+  const [showAll, setShowAll] = useState(false)
   const { data, error, loading, reload } = useApi(async () => {
     const [week, entries] = await Promise.all([api.get('/budgets/time/week'), api.get('/budgets/time', { user_id: user.id })])
-    return { week, entries: entries.entries }
+    return { week, entries: entries.entries, openFrom: entries.timesheet_open_from }
   }, [])
   const project = projectId || data?.week.assignments[0]?.project_id || ''
   const milestones = useApi(() => (project ? api.get('/milestones', { project_id: project }).then((d) => d.milestones) : Promise.resolve([])), [project])
@@ -76,24 +78,64 @@ export default function TimeLog() {
         </Panel>
       </div>
 
-      <Panel title="Recent entries">
+      <Panel title="Recent entries" actions={data.openFrom && <span className="muted small">You can correct entries from {fmtShort(data.openFrom)} on. Older weeks are closed.</span>}>
         {mine.length ? (
           <div className="table-wrap">
             <table className="table">
               <thead><tr><th>Date</th><th>Project</th><th>Milestone</th><th>Note</th><th className="r">Hours</th><th /></tr></thead>
               <tbody>
-                {mine.slice(0, 50).map((t) => (
+                {mine.slice(0, showAll ? 200 : 12).map((t) => (
                   <tr key={t.id}>
                     <td>{fmtShort(t.work_date)}</td><td>{t.project_name}</td><td>{t.milestone_name || '–'}</td><td>{t.note || '–'}</td>
                     <td className="r num">{t.hours}</td>
-                    <td className="r"><button className="link-btn danger" onClick={() => window.confirm(`Delete ${t.hours} h on ${fmtShort(t.work_date)}?`) && act(() => api.del(`/budgets/time/${t.id}`), 'Entry deleted').then(reload)}>Delete</button></td>
+                    <td className="r nowrap">
+                      {t.editable ? (
+                        <>
+                          <button className="link-btn" onClick={() => setEditing(t)}>Edit</button>
+                          <button className="link-btn danger" onClick={() => window.confirm(`Delete ${t.hours} h on ${fmtShort(t.work_date)}?`) && act(() => api.del(`/budgets/time/${t.id}`), 'Entry deleted').then(reload)}>Delete</button>
+                        </>
+                      ) : <Tag title="This timesheet week is closed. An admin can correct it.">Locked</Tag>}
+                    </td>
                   </tr>
                 ))}
               </tbody>
             </table>
+            {mine.length > 12 && (
+              <button className="link-btn show-more" onClick={() => setShowAll((v) => !v)}>
+                {showAll ? 'Show fewer' : `Show older entries (${Math.min(mine.length, 200) - 12} more)`}
+              </button>
+            )}
           </div>
         ) : <Empty title="No time logged yet" />}
       </Panel>
+      {editing && <EditEntry entry={editing} openFrom={data.openFrom} onClose={() => setEditing(null)} onSaved={() => { setEditing(null); reload() }} />}
     </>
+  )
+}
+
+function EditEntry({ entry, openFrom, onClose, onSaved }) {
+  const toast = useToast()
+  const milestones = useApi(() => api.get('/milestones', { project_id: entry.project_id }).then((d) => d.milestones), [entry.project_id])
+  const submit = async (fd) => {
+    const body = formToObject(fd, ['hours'])
+    body.milestone_id = fd.get('milestone_id') || null
+    body.note = fd.get('note') || ''
+    await api.patch(`/budgets/time/${entry.id}`, body)
+    toast('Entry updated')
+    onSaved()
+  }
+  return (
+    <FormModal title={`Edit time on ${entry.project_name}`} submitLabel="Save entry" onSubmit={submit} onClose={onClose}>
+      <Field label="Date" hint={`From ${fmtShort(openFrom)} to today`}><input name="work_date" type="date" min={openFrom} max={todayISO()} defaultValue={entry.work_date} required /></Field>
+      <Field label="Hours"><input name="hours" type="number" min="0.25" max="8" step="0.25" defaultValue={entry.hours} required /></Field>
+      <Field label="Milestone" wide>
+        <select name="milestone_id" defaultValue={entry.milestone_id || ''} key={milestones.data ? 'ready' : 'loading'}>
+          <option value="">No specific milestone</option>
+          {(milestones.data || []).filter((m) => m.status !== 'pending').map((m) => <option key={m.id} value={m.id}>{m.position}. {m.name}</option>)}
+        </select>
+      </Field>
+      <Field label="Note" wide><input name="note" maxLength={500} defaultValue={entry.note || ''} /></Field>
+      <p className="muted small field-wide">The project can't be changed. To move time to another project, delete this entry and log it there. Every change is recorded in the audit log.</p>
+    </FormModal>
   )
 }
