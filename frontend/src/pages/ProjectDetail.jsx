@@ -4,12 +4,13 @@ import { api } from '../services/api'
 import { useAuth } from '../context/AuthContext'
 import {
   Button, Empty, ErrorNote, Field, FormModal, Loading, Panel, Progress, Stat, Tag,
-  formToObject, useAction, useApi,
+  formToObject, useAction, useApi, useToast,
 } from '../components/ui'
 import MilestoneLine from '../components/MilestoneLine'
 import { RiskTags } from '../components/ProjectRow'
 import { ProjectForm } from './Projects'
 import Forecast from '../components/Forecast'
+import { MilestonePeoplePicker, TaskRows, TeamPicker } from '../components/Pickers'
 import { ChangeList, decidePath } from './Approvals'
 import { BUDGET_STATUS, MILESTONE_STATUS, fmtDate, fmtHours, fmtMoney, fmtPct, fmtShort, todayISO } from '../utils/format'
 
@@ -118,6 +119,7 @@ function PendingChanges({ projectId, onChanged }) {
 // ---------- Milestones ----------
 
 function Milestones({ project, milestones, manage, reload }) {
+  const toast = useToast()
   const [params, setParams] = useSearchParams()
   const [adding, setAdding] = useState(false)
   const current = milestones.find((m) => m.status === 'in_progress') || milestones.find((m) => m.status === 'pending') || milestones[milestones.length - 1]
@@ -145,15 +147,16 @@ function Milestones({ project, milestones, manage, reload }) {
       </Panel>
 
       {selectedId && milestones.some((m) => m.id === selectedId) && (
-        <MilestoneDetail key={selectedId} id={selectedId} project={project} manage={manage} onChanged={reload} />
+        <MilestoneDetail key={selectedId} id={selectedId} project={project} milestones={milestones} manage={manage} onChanged={reload} onSelect={select} />
       )}
 
       {adding && (
         <MilestoneForm
           project={project}
+          milestones={milestones}
           defaults={{ start_date: last ? nextDay(last.end_date) : project.start_date }}
           onClose={() => setAdding(false)}
-          onSaved={(m) => { setAdding(false); reload(); select(m) }}
+          onSaved={(m) => { setAdding(false); toast(`Milestone "${m.name}" added`); reload(); select(m) }}
         />
       )}
     </>
@@ -166,12 +169,27 @@ function nextDay(iso) {
   return d.toISOString().slice(0, 10)
 }
 
-function MilestoneForm({ project, milestone, defaults = {}, onClose, onSaved }) {
+function MilestoneForm({ project, milestone, milestones = [], defaults = {}, onClose, onSaved }) {
+  // New milestones can be staffed and given tasks in the same step.
+  const [people, setPeople] = useState([])
+  const [tasks, setTasks] = useState([{ title: '', assigned_to: '' }])
+  const busy = {}
+  milestones.filter((x) => x.status !== 'completed').forEach((x) => x.members.forEach((mem) => { busy[mem.user_id] = x.name }))
+  const assignees = project.members.filter((x) => people.includes(x.user_id))
+
   const submit = async (fd) => {
     const body = formToObject(fd)
     const d = milestone
       ? await api.patch(`/milestones/${milestone.id}`, { ...body, description: fd.get('description') || '' })
-      : await api.post('/milestones', { ...body, project_id: project.id })
+      : await api.post('/milestones', {
+        ...body,
+        project_id: project.id,
+        member_ids: people,
+        tasks: tasks.filter((t) => t.title.trim()).map((t) => ({
+          title: t.title.trim(),
+          assigned_to: people.includes(t.assigned_to) ? t.assigned_to : undefined,
+        })),
+      })
     onSaved(d.milestone)
   }
   const locked = milestone?.status === 'completed'
@@ -181,11 +199,13 @@ function MilestoneForm({ project, milestone, defaults = {}, onClose, onSaved }) 
       <Field label="Deliverables" wide hint="What has to be true for this milestone to be done"><textarea name="description" rows={3} defaultValue={milestone?.description || ''} /></Field>
       <Field label="Start date"><input name="start_date" type="date" required disabled={locked} min={project.start_date} max={project.end_date} defaultValue={milestone?.start_date || defaults.start_date} /></Field>
       <Field label="End date"><input name="end_date" type="date" required disabled={locked} min={project.start_date} max={project.end_date} defaultValue={milestone?.end_date} /></Field>
+      {!milestone && <MilestonePeoplePicker team={project.members} busy={busy} value={people} onChange={setPeople} />}
+      {!milestone && <TaskRows rows={tasks} onChange={setTasks} assignees={assignees} />}
     </FormModal>
   )
 }
 
-function MilestoneDetail({ id, project, manage, onChanged }) {
+function MilestoneDetail({ id, project, milestones = [], manage, onChanged, onSelect }) {
   const { user } = useAuth()
   const act = useAction()
   const [editing, setEditing] = useState(false)
@@ -200,10 +220,18 @@ function MilestoneDetail({ id, project, manage, onChanged }) {
   const isMember = m.members.some((x) => x.user_id === user.id)
   const canCheck = (t) => m.status === 'in_progress' && (manage || t.assigned_to === user.id || (!t.assigned_to && isMember))
 
-  const complete = () => {
+  const complete = async () => {
     const open = m.tasks_total - m.tasks_completed
     if (open && !window.confirm(`${open} task(s) are still open. Complete the milestone anyway?`)) return
-    run(() => api.post(`/milestones/${m.id}/complete`, open ? { force: true } : {}), 'Milestone completed')
+    const ok = await act(() => api.post(`/milestones/${m.id}/complete`, open ? { force: true } : {}), 'Milestone completed')
+    if (!ok) return
+    // Save a step: offer to start the next milestone right away.
+    const next = milestones.find((x) => x.position === m.position + 1 && x.status === 'pending')
+    if (next && window.confirm(`Start milestone ${next.position}, "${next.name}", now?`)) {
+      await act(() => api.post(`/milestones/${next.id}/start`), `Milestone "${next.name}" started`)
+      onSelect?.(next)
+    }
+    refresh()
   }
 
   return (
@@ -271,7 +299,7 @@ function MilestoneDetail({ id, project, manage, onChanged }) {
       </div>
 
       {editing && <MilestoneForm project={project} milestone={m} onClose={() => setEditing(false)} onSaved={() => { setEditing(false); refresh() }} />}
-      {addingMember && <AddMilestoneMember project={project} milestone={m} onClose={() => setAddingMember(false)} onSaved={() => { setAddingMember(false); refresh() }} />}
+      {addingMember && <AddMilestoneMember project={project} milestone={m} milestones={milestones} onClose={() => setAddingMember(false)} onSaved={() => { setAddingMember(false); refresh() }} />}
     </Panel>
   )
 }
@@ -298,21 +326,35 @@ function AddTask({ milestone, onAdded }) {
   )
 }
 
-function AddMilestoneMember({ project, milestone, onClose, onSaved }) {
+function AddMilestoneMember({ project, milestone, milestones, onClose, onSaved }) {
+  const [chosen, setChosen] = useState([])
   const candidates = project.members.filter((x) => !milestone.members.some((y) => y.user_id === x.user_id))
+  const busy = {}
+  milestones.filter((x) => x.status !== 'completed' && x.id !== milestone.id)
+    .forEach((x) => x.members.forEach((mem) => { busy[mem.user_id] = x.name }))
+  const submit = async () => {
+    if (!chosen.length) throw new Error('Choose at least one person.')
+    await addEach(chosen, (id) => api.post(`/milestones/${milestone.id}/members`, { user_id: id }),
+      (id) => project.members.find((x) => x.user_id === id)?.name, onSaved)
+  }
   return (
-    <FormModal title={`Add to ${milestone.name}`} submitLabel="Add to milestone" onClose={onClose}
-      onSubmit={async (fd) => { await api.post(`/milestones/${milestone.id}/members`, { user_id: fd.get('user_id') }); onSaved() }}>
-      {candidates.length ? (
-        <Field label="Person" wide hint="Only people on the project team can join. Each person can have one open milestone per project.">
-          <select name="user_id" required defaultValue="">
-            <option value="" disabled>Choose a team member</option>
-            {candidates.map((x) => <option key={x.user_id} value={x.user_id}>{x.name}</option>)}
-          </select>
-        </Field>
-      ) : <p className="muted field-wide">Everyone on the project team is already on this milestone. Add people on the Team tab first.</p>}
+    <FormModal title={`Add people to ${milestone.name}`} submitLabel="Add to milestone" onClose={onClose} onSubmit={submit}>
+      {candidates.length
+        ? <MilestonePeoplePicker team={candidates} busy={busy} value={chosen} onChange={setChosen} />
+        : <p className="muted field-wide">Everyone on the project team is already on this milestone. Add people on the Team tab first.</p>}
     </FormModal>
   )
+}
+
+/** Run one request per person; report any that fail by name, keep the ones that worked. */
+async function addEach(ids, post, nameOf, onSaved) {
+  const failed = []
+  for (const id of ids) {
+    try { await post(id) } catch (err) { failed.push(`${nameOf(id) || 'Someone'}: ${err.message}`) }
+  }
+  if (failed.length === ids.length) throw new Error(failed.join(' '))
+  if (failed.length) window.alert(`Added ${ids.length - failed.length}. Not added:\n${failed.join('\n')}`)
+  onSaved()
 }
 
 // ---------- Team ----------
@@ -339,7 +381,7 @@ function Team({ project, manage, reload }) {
                   <td className="r num">{x.hours_logged === undefined ? '–' : fmtHours(x.hours_logged)}</td>
                   {manage && (
                     <td className="r nowrap">
-                      <button className="link-btn" onClick={() => setEditing(x)}>Change hours</button>
+                      <button className="link-btn" onClick={() => setEditing(x)}>Change hours or dates</button>
                       <button className="link-btn danger" onClick={() => window.confirm(`Remove ${x.name} from the project?`) && act(() => api.del(`/projects/${project.id}/members/${x.user_id}`), 'Removed from project').then(reload)}>Remove</button>
                     </td>
                   )}
@@ -353,8 +395,28 @@ function Team({ project, manage, reload }) {
           People can work on several projects, up to 40 hours a week in total.
         </Empty>
       )}
-      {(adding || editing) && <MemberForm project={project} member={editing} onClose={() => { setAdding(false); setEditing(null) }} onSaved={() => { setAdding(false); setEditing(null); reload() }} />}
+      {adding && <AddPeople project={project} onClose={() => setAdding(false)} onSaved={() => { setAdding(false); reload() }} />}
+      {editing && <MemberForm project={project} member={editing} onClose={() => setEditing(null)} onSaved={() => { setEditing(null); reload() }} />}
     </Panel>
+  )
+}
+
+function AddPeople({ project, onClose, onSaved }) {
+  const { user } = useAuth()
+  const [team, setTeam] = useState({})
+  const people = useApi(() => api.get('/projects/allocation').then((d) => d.people.filter(
+    (u) => (user.role !== 'admin' || u.role !== 'admin') && !project.members.some((x) => x.user_id === u.id))), [])
+  const submit = async () => {
+    const ids = Object.keys(team)
+    if (!ids.length) throw new Error('Choose at least one person.')
+    await addEach(ids, (id) => api.post(`/projects/${project.id}/members`, { user_id: id, hours_per_week: Number(team[id]) }),
+      (id) => people.data?.find((u) => u.id === id)?.name, onSaved)
+  }
+  return (
+    <FormModal title="Add people to the project" submitLabel="Add to project" onClose={onClose} onSubmit={submit}>
+      <TeamPicker people={people.data || []} loading={people.loading} value={team} onChange={setTeam} later={false} />
+      <p className="muted small field-wide">They start today, or on the project start date if that is later, and stay until the project ends. Use "Change hours or dates" to adjust.</p>
+    </FormModal>
   )
 }
 

@@ -104,8 +104,10 @@ def change_password(headers, body):
 
 
 def health():
-    row = query_one("SELECT version() AS version, (SELECT COUNT(*) FROM users) AS users")
-    return response(200, {"service": SERVICE_NAME, "status": "ok", **row})
+    # Public and unauthenticated: confirm the database answers, but reveal nothing about it
+    # (no version string or user count that would help an attacker).
+    query_one("SELECT 1 AS ok")
+    return response(200, {"service": SERVICE_NAME, "status": "ok"})
 
 
 def handler(event=None, context=None):

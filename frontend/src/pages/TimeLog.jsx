@@ -20,6 +20,8 @@ export default function TimeLog() {
   if (error) return <ErrorNote error={error} onRetry={reload} />
   const { week } = data
   const mine = data.entries
+  // Default to the milestone this person is working on in the chosen project.
+  const myMilestone = (milestones.data || []).find((m) => m.status === 'in_progress' && m.members.some((x) => x.user_id === user.id))?.id || ''
 
   const submit = async (e) => {
     e.preventDefault()
@@ -43,8 +45,8 @@ export default function TimeLog() {
                     {week.assignments.map((a) => <option key={a.project_id} value={a.project_id}>{a.project_name} ({a.hours_per_week} h/week planned)</option>)}
                   </select>
                 </Field>
-                <Field label="Milestone" wide hint="Optional. Only milestones that have started.">
-                  <select name="milestone_id" defaultValue="" key={project}>
+                <Field label="Milestone" wide hint="Optional. Your current milestone is picked for you. Only milestones that have started are listed.">
+                  <select name="milestone_id" defaultValue={myMilestone} key={`${project}-${myMilestone}`}>
                     <option value="">No specific milestone</option>
                     {(milestones.data || []).filter((m) => m.status !== 'pending').map((m) => <option key={m.id} value={m.id}>{m.position}. {m.name}</option>)}
                   </select>
@@ -84,7 +86,7 @@ export default function TimeLog() {
                   <tr key={t.id}>
                     <td>{fmtShort(t.work_date)}</td><td>{t.project_name}</td><td>{t.milestone_name || '–'}</td><td>{t.note || '–'}</td>
                     <td className="r num">{t.hours}</td>
-                    <td className="r"><button className="link-btn danger" onClick={() => act(() => api.del(`/budgets/time/${t.id}`), 'Entry deleted').then(reload)}>Delete</button></td>
+                    <td className="r"><button className="link-btn danger" onClick={() => window.confirm(`Delete ${t.hours} h on ${fmtShort(t.work_date)}?`) && act(() => api.del(`/budgets/time/${t.id}`), 'Entry deleted').then(reload)}>Delete</button></td>
                   </tr>
                 ))}
               </tbody>

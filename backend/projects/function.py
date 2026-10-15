@@ -7,7 +7,8 @@ Routes (all under /api/projects, all require Authorization: Bearer <token>):
                                          query: q, status=active|completed, archived=true (admin)
     GET    /allocation                -> weekly hours per person across active projects (admin, manager)
     GET    /{id}                      -> project detail with members and milestones
-    POST   /                          -> create (admin, manager)
+    POST   /                          -> create (admin, manager); optional members: [{user_id, hours_per_week,
+                                         assigned_from?, assigned_to?}] staffs it in the same request
     PATCH  /{id}                      -> edit (admin, or the project's manager)
     POST   /{id}/complete             -> mark complete, auto-archives (admin, project manager)
     POST   /{id}/archive              -> archive (admin)
@@ -506,6 +507,22 @@ def create_project(viewer, body):
     else:
         manager_id = str(viewer["id"])
 
+    # Optional starting team. Every person is checked before anything is written,
+    # so a bad entry never leaves a half-staffed project behind.
+    draft = {"id": None, "start_date": start, "end_date": end}
+    members = body.get("members") or []
+    if not isinstance(members, list):
+        raise ApiError(400, "members must be a list")
+    seen, team = set(), []
+    for entry in members:
+        if not isinstance(entry, dict):
+            raise ApiError(400, "Each member needs a user_id")
+        member = _validated_member(viewer, draft, entry)
+        if member[0] in seen:
+            raise ApiError(400, "The same person is listed twice")
+        seen.add(member[0])
+        team.append(member)
+
     row = execute(
         """
         INSERT INTO projects (name, description, manager_id, start_date, end_date, budget_hours, planned_budget)
@@ -522,6 +539,9 @@ def create_project(viewer, body):
     audit(viewer, "project.create", "project", row["id"], name, {
         "manager_id": manager_id, "start_date": start, "end_date": end,
         "budget_hours": body.get("budget_hours", 0), "planned_budget": body.get("planned_budget", 0)})
+    project = {"id": row["id"], "name": name}
+    for member in team:
+        _insert_member(viewer, project, *member)
     return get_project(viewer, row["id"], status=201)
 
 
@@ -639,24 +659,33 @@ def _member_window(body, project, current=None):
     return start, end
 
 
-def add_member(viewer, project_id, body):
-    project = _load_for(viewer, project_id, manage=True)
-    if project["status"] == "completed":
-        raise ApiError(409, "Cannot assign people to a completed project")
+def _validated_member(viewer, project, body):
+    """Check one assignment and return (user_id, hours, start, end). Writes nothing.
+    `project` may be a draft with id None while a new project is being created."""
     require_fields(body, "user_id")
     user_id = _uuid(body["user_id"], "user_id")
-    person = query_one("SELECT id, role, manager_id, is_archived FROM users WHERE id = %s", (user_id,))
+    person = query_one("SELECT id, name, role, manager_id, is_archived FROM users WHERE id = %s", (user_id,))
     if not person or person["is_archived"]:
         raise ApiError(400, "User not found or archived")
     if viewer["role"] == "manager" and str(person["manager_id"]) != str(viewer["id"]) \
             and str(person["id"]) != str(viewer["id"]):
-        raise ApiError(403, "Managers can only assign their own direct reports")
-    if _is_member(project["id"], user_id):
-        raise ApiError(409, "That person is already on this project")
-
+        raise ApiError(403, f"Managers can only assign their own direct reports ({person['name']} is not)")
+    if project["id"] and _is_member(project["id"], user_id):
+        raise ApiError(409, f"{person['name']} is already on this project")
     hours = _number(body.get("hours_per_week", 8), "hours_per_week", 0.5, WEEKLY_CAP)
     start, end = _member_window(body, project)
-    _check_capacity(user_id, hours, start, end or project["end_date"], project["id"])
+    booked = _overlap_hours(user_id, start, end or project["end_date"], exclude_project=project["id"])
+    if booked + hours > WEEKLY_CAP:
+        raise ApiError(
+            409,
+            f"Over-allocation: {person['name']} is already booked {booked:g} h/week in that period. "
+            f"Adding {hours:g} would exceed the {WEEKLY_CAP:g} h/week limit "
+            f"({WEEKLY_CAP - booked:g} h/week available).",
+        )
+    return user_id, hours, start, end
+
+
+def _insert_member(viewer, project, user_id, hours, start, end):
     execute(
         "INSERT INTO project_members (project_id, user_id, hours_per_week, assigned_from, assigned_to) "
         "VALUES (%s, %s, %s, %s, %s)",
@@ -665,6 +694,13 @@ def add_member(viewer, project_id, body):
     audit(viewer, "project.member_add", "project", project["id"], project["name"],
           {"user_id": user_id, "user_name": _name(user_id), "hours_per_week": hours,
            "assigned_from": start, "assigned_to": end})
+
+
+def add_member(viewer, project_id, body):
+    project = _load_for(viewer, project_id, manage=True)
+    if project["status"] == "completed":
+        raise ApiError(409, "Cannot assign people to a completed project")
+    _insert_member(viewer, project, *_validated_member(viewer, project, body))
     return get_project(viewer, project["id"], status=201)
 
 

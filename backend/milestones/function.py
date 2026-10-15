@@ -6,7 +6,8 @@ Routes (all under /api/milestones, all require Authorization: Bearer <token>):
     GET    /?project_id=...              -> milestones of a project, in order, with progress
     GET    /mine                         -> caller's open milestones with their tasks (dashboard)
     GET    /{id}                         -> one milestone with members and tasks
-    POST   /                             -> create {project_id, name, start_date, end_date, description?}
+    POST   /                             -> create {project_id, name, start_date, end_date, description?,
+                                            member_ids?: [user_id], tasks?: [{title, assigned_to?}]}
     PATCH  /{id}                         -> edit name, description, dates
     DELETE /{id}                         -> delete a milestone that has not started
     POST   /{id}/start                   -> begin work (previous milestone must be completed)
@@ -233,6 +234,7 @@ def create_milestone(viewer, body):
         "SELECT * FROM milestones WHERE project_id = %s ORDER BY position DESC LIMIT 1", (project["id"],)
     )
     _check_dates(project, start, end, prev=last)
+    member_ids, tasks = _validated_new_milestone_people(project, body)
     row = execute(
         """
         INSERT INTO milestones (project_id, position, name, description, start_date, end_date)
@@ -245,9 +247,65 @@ def create_milestone(viewer, body):
             start, end,
         ),
     )
-    audit(viewer, "milestone.create", "milestone", row["id"], body["name"].strip(),
+    ms_name = body["name"].strip()
+    audit(viewer, "milestone.create", "milestone", row["id"], ms_name,
           {"project_id": project["id"], "project_name": project["name"], "start_date": start, "end_date": end})
+    for user_id, user_name in member_ids:
+        execute("INSERT INTO milestone_members (milestone_id, user_id) VALUES (%s, %s)", (row["id"], user_id))
+        audit(viewer, "milestone.member_add", "milestone", row["id"], ms_name, {"user_id": user_id, "user_name": user_name})
+    for title, assignee in tasks:
+        execute("INSERT INTO tasks (milestone_id, title, assigned_to) VALUES (%s, %s, %s)", (row["id"], title, assignee))
+        audit(viewer, "task.create", "milestone", row["id"], ms_name, {"title": title})
     return response(201, {"milestone": _detail(viewer, row["id"])})
+
+
+def _validated_new_milestone_people(project, body):
+    """Check the optional people and tasks sent with a new milestone. Writes nothing.
+    Returns ([(user_id, name)], [(title, assigned_to)])."""
+    raw_members = body.get("member_ids") or []
+    raw_tasks = body.get("tasks") or []
+    if not isinstance(raw_members, list) or not isinstance(raw_tasks, list):
+        raise ApiError(400, "member_ids and tasks must be lists")
+    members, seen = [], set()
+    for value in raw_members:
+        user_id = _uuid(value, "member_ids")
+        if user_id in seen:
+            continue
+        seen.add(user_id)
+        person = query_one(
+            "SELECT u.name FROM project_members pm JOIN users u ON u.id = pm.user_id "
+            "WHERE pm.project_id = %s AND pm.user_id = %s AND u.is_archived = FALSE",
+            (project["id"], user_id),
+        )
+        if not person:
+            raise ApiError(400, "Only people on the project team can join a milestone. Add them on the Team tab first.")
+        other = query_one(
+            """
+            SELECT m.position, m.name FROM milestone_members x JOIN milestones m ON m.id = x.milestone_id
+            WHERE x.user_id = %s AND m.project_id = %s AND m.status <> 'completed'
+            """,
+            (user_id, project["id"]),
+        )
+        if other:
+            raise ApiError(
+                409,
+                f"{person['name']} is already working on milestone #{other['position']} '{other['name']}'. "
+                "People can only have one open milestone per project.",
+            )
+        members.append((user_id, person["name"]))
+    if len(raw_tasks) > 50:
+        raise ApiError(400, "Add at most 50 tasks at once")
+    tasks = []
+    for t in raw_tasks:
+        t = t if isinstance(t, dict) else {"title": t}
+        title = _text(t.get("title"), "task title")
+        assignee = t.get("assigned_to") or None
+        if assignee is not None:
+            assignee = _uuid(assignee, "assigned_to")
+            if assignee not in seen:
+                raise ApiError(400, f"Task '{title}' is assigned to someone who is not on this milestone")
+        tasks.append((title, assignee))
+    return members, tasks
 
 
 def update_milestone(viewer, ms_id, body):

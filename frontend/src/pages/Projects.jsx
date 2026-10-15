@@ -4,6 +4,7 @@ import { api } from '../services/api'
 import { useAuth } from '../context/AuthContext'
 import { Button, Empty, ErrorNote, Field, FormModal, Loading, PageHeader, formToObject, useApi, useToast } from '../components/ui'
 import ProjectRow from '../components/ProjectRow'
+import { TeamPicker } from '../components/Pickers'
 import { todayISO } from '../utils/format'
 
 export default function Projects() {
@@ -68,8 +69,16 @@ export function ProjectForm({ project, onClose, onSaved }) {
     [],
   )
 
+  // Starting team, chosen in the same form (new projects only).
+  const [team, setTeam] = useState({})
+  const people = useApi(
+    () => (editing ? Promise.resolve([]) : api.get('/projects/allocation').then((d) => d.people.filter((p) => user.role !== 'admin' || p.role !== 'admin'))),
+    [],
+  )
+
   const submit = async (fd) => {
     const body = formToObject(fd, ['budget_hours', 'planned_budget'])
+    if (!editing) body.members = Object.entries(team).map(([user_id, hours]) => ({ user_id, hours_per_week: Number(hours) }))
     if (editing) {
       if (!fd.get('description')) body.description = ''
       const d = await api.patch(`/projects/${project.id}`, body)
@@ -78,7 +87,7 @@ export function ProjectForm({ project, onClose, onSaved }) {
       onClose()
     } else {
       const d = await api.post('/projects', body)
-      toast('Project created')
+      toast(body.members.length ? `Project created with ${body.members.length} ${body.members.length === 1 ? 'person' : 'people'}` : 'Project created')
       navigate(`/projects/${d.project.id}`)
     }
   }
@@ -106,6 +115,7 @@ export function ProjectForm({ project, onClose, onSaved }) {
           )}
         </Field>
       )}
+      {!editing && <TeamPicker people={people.data || []} loading={people.loading} value={team} onChange={setTeam} />}
     </FormModal>
   )
 }

@@ -94,4 +94,13 @@ check("start M4", call(mil, "POST", f"{P}/{m4['id']}/start", None, M), 200)
 check("complete M4", call(mil, "POST", f"{P}/{m4['id']}/complete", None, M), 200)
 check("project completes once all milestones done", call(proj, "POST", f"/api/projects/{p['id']}/complete", None, M), 200)
 check("completed project milestones locked", call(mil, "POST", P, {"project_id": p["id"], "name": "x", "start_date": "2026-10-01", "end_date": "2026-10-31"}, A), 409)
+# People and tasks sent with a new milestone
+q = call(proj, "POST", "/api/projects", {"name": f"Kit {tag}", "start_date": "2026-01-01", "end_date": "2026-12-31",
+         "members": [{"user_id": e1["user"]["id"], "hours_per_week": 5, "assigned_from": "2026-01-01"}]}, M)[1]["project"]
+check("new milestone with non-team person refused", call(mil, "POST", P, {"project_id": q["id"], "name": "K1", "start_date": "2026-01-01", "end_date": "2026-01-31", "member_ids": [out["user"]["id"]]}, M), 400)
+check("new milestone task for non-member refused", call(mil, "POST", P, {"project_id": q["id"], "name": "K1", "start_date": "2026-01-01", "end_date": "2026-01-31", "member_ids": [e1["user"]["id"]], "tasks": [{"title": "x", "assigned_to": e2["user"]["id"]}]}, M), 400)
+s, b = call(mil, "GET", P, None, M, {"project_id": q["id"]}); assert b["milestones"] == []; print("PASS refused milestone creates leave nothing behind")
+k1 = check("new milestone with people and tasks", call(mil, "POST", P, {"project_id": q["id"], "name": "K1", "start_date": "2026-01-01", "end_date": "2026-01-31", "member_ids": [e1["user"]["id"]], "tasks": [{"title": "Kickoff", "assigned_to": e1["user"]["id"]}, {"title": "Shared notes"}, "Plain string task"]}, M), 201)["milestone"]
+assert [x["name"] for x in k1["members"]] == ["Ann"] and len(k1["tasks"]) == 3; print("PASS milestone created with 1 person and 3 tasks")
+check("person on open K1 cannot be put on new K2", call(mil, "POST", P, {"project_id": q["id"], "name": "K2", "start_date": "2026-02-01", "end_date": "2026-02-28", "member_ids": [e1["user"]["id"]]}, M), 409)
 print("ALL MILESTONE TESTS PASSED")

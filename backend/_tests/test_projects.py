@@ -66,6 +66,15 @@ check("delete refused", call(proj, "DELETE", f"{P}/{p1['id']}", None, A), 405)
 al = check("allocation (admin)", call(proj, "GET", f"{P}/allocation", None, A), 200)
 print("    Eli hours/week:", [p["hours_this_week"] for p in al["people"] if p["name"] == "Eli"])
 check("allocation forbidden for employee", call(proj, "GET", f"{P}/allocation", None, E), 403)
+# Starting team sent with the new project
+before = db.query_one("SELECT COUNT(*) AS n FROM projects")["n"]
+check("create with another manager's report refused", call(proj, "POST", P, {"name": "Comet", "start_date": "2026-09-01", "end_date": "2026-12-31", "members": [{"user_id": e2["user"]["id"]}]}, M), 403)
+check("create with over-allocated person refused", call(proj, "POST", P, {"name": "Comet", "start_date": "2026-09-01", "end_date": "2026-12-31", "members": [{"user_id": e1["user"]["id"], "hours_per_week": 10}]}, M), 409)
+check("create with the same person twice refused", call(proj, "POST", P, {"name": "Comet", "start_date": "2026-09-01", "end_date": "2026-12-31", "members": [{"user_id": m["user"]["id"]}, {"user_id": m["user"]["id"]}]}, M), 400)
+assert db.query_one("SELECT COUNT(*) AS n FROM projects")["n"] == before; print("PASS refused creates leave no project behind")
+c = check("manager creates project with a team", call(proj, "POST", P, {"name": "Comet", "start_date": "2026-09-01", "end_date": "2026-12-31", "members": [{"user_id": e1["user"]["id"], "hours_per_week": 5}, {"user_id": m["user"]["id"], "hours_per_week": 4}]}, M), 201)["project"]
+assert c["member_count"] == 2 and sorted(float(x["hours_per_week"]) for x in c["members"]) == [4.0, 5.0]; print("PASS starting team saved with hours")
+check("Comet team member removable", call(proj, "DELETE", f"{P}/{c['id']}/members/{e1['user']['id']}", None, M), 200)
 # milestone blocks completion
 db.execute("INSERT INTO milestones (project_id, position, name, start_date, end_date) VALUES (%s, 1, 'M1', '2026-09-01', '2026-10-01')", (p1["id"],))
 check("cannot shrink dates past milestone", call(proj, "PATCH", f"{P}/{p1['id']}", {"start_date": "2026-09-15"}, M), 409)

@@ -422,3 +422,20 @@ input:disabled, select:disabled { background: var(--paper); color: var(--muted);
   .toasts { left: 16px; right: 16px; bottom: 76px; }
   .toolbar input[type='search'] { max-width: none; }
 }
+
+/* ---------- Pickers inside create forms ---------- */
+.picker { border: 1px solid var(--rule); border-radius: var(--r-ctl); padding: 10px 12px 12px; margin: 0; display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.picker legend { padding: 0 4px; }
+.pick-list { list-style: none; margin: 0; padding: 0; max-height: 236px; overflow: auto; }
+.pick-list li { display: flex; align-items: center; gap: 10px; padding: 6px 4px; border-top: 1px solid var(--rule-soft); font-size: var(--fs-sm); flex-wrap: wrap; }
+.pick-list li:first-child { border-top: 0; }
+.pick-list li.on { background: var(--cobalt-wash); border-radius: 6px; }
+.pick-main { display: flex; gap: 10px; align-items: center; flex: 1 1 200px; cursor: pointer; }
+.pick-hours { display: inline-flex; align-items: center; gap: 6px; }
+.pick-hours input { width: 72px; }
+.task-rows { display: flex; flex-direction: column; gap: 6px; }
+.task-row { display: flex; gap: 6px; align-items: center; }
+.task-row input { flex: 2 1 160px; min-width: 0; }
+.task-row select { flex: 1 1 140px; width: auto; min-width: 0; }
+.add-row { align-self: flex-start; padding-left: 0; }
+.text-bad { color: var(--bad); }
