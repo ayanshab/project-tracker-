@@ -7,9 +7,16 @@ export function AuthProvider({ children }) {
   const [user, setUser] = useState(null)
   const [loading, setLoading] = useState(Boolean(getToken()))
 
+  // Every session starts on the home page. Without this, the hash is left wherever
+  // the last person signed out (usually #/profile) and the next sign-in opens there.
+  const goHome = () => {
+    if (window.location.hash && window.location.hash !== '#/') window.location.hash = '#/'
+  }
+
   const logout = useCallback(() => {
     setToken(null)
     setUser(null)
+    goHome()
   }, [])
 
   useEffect(() => {
@@ -25,6 +32,7 @@ export function AuthProvider({ children }) {
   const login = useCallback(async (username, password) => {
     const d = await api.post('/auth/login', { username, password })
     setToken(d.token)
+    goHome()
     setUser(d.user)
     return d.user
   }, [])

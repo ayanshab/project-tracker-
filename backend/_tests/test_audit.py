@@ -105,4 +105,16 @@ except Exception as ex:
     assert "append-only" in str(ex); print("PASS audit log cannot be deleted")
 page = call(users, "GET", "/api/users/audit", None, A, {"limit": 2})[1]
 assert len(page["entries"]) == 2 and page["has_more"] and "project.create" in page["actions"]; print("PASS paging and action list")
+
+# ---------- CSV export: every matching row, oldest first, and the export is itself logged ----------
+check("employee cannot export", call(users, "GET", "/api/users/audit/export", None, E), 403)
+check("manager cannot export", call(users, "GET", "/api/users/audit/export", None, M), 403)
+s, ex = call(users, "GET", "/api/users/audit/export", None, A, {"entity_id": p["id"]}); check("admin export", (s, ex), 200)
+assert ex["entries"] and ex["truncated"] is False and ex["cap"] == 10000
+times = [x["occurred_at"] for x in ex["entries"]]
+assert times == sorted(times); print("PASS export is oldest first:", len(ex["entries"]), "rows for one project")
+assert {x["action"] for x in ex["entries"]} >= {"project.create", "project.complete"}; print("PASS export carries the project's full history")
+logged = log(A, action="audit.export")[0]
+assert logged["actor_name"] == "System Administrator" and logged["details"]["rows"] == len(ex["entries"]) and logged["details"]["filters"] == {"entity_id": p["id"]}
+print("PASS the export itself is recorded with its filters and row count:", logged["details"])
 print("ALL AUDIT TESTS PASSED")

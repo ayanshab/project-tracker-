@@ -18,6 +18,8 @@ Routes (all under /api/users, all require Authorization: Bearer <token>):
     request (a "reason" is required) until another admin approves them.
     GET    /audit                -> admin: audit log; query: q, action, entity_type, entity_id,
                                     actor_id, from, to (YYYY-MM-DD), limit, offset
+    GET    /audit/export         -> admin: every matching entry (same filters, up to 10,000) for a
+                                    CSV download; the export is itself recorded as audit.export
 
 Visibility:
     admin    -> everyone
@@ -402,8 +404,8 @@ def reset_password(viewer, user_id):
 
 # ---------- Audit log (admin only) ----------
 
-def audit_log(viewer, params):
-    require_role(viewer, "admin")
+def _audit_filters(params):
+    """Build the WHERE clause shared by the audit page and the export, from the same query params."""
     where, args = [], []
     if params.get("actor_id"):
         where.append("actor_id = %s"); args.append(_check_uuid(params["actor_id"], "actor_id"))
@@ -421,12 +423,18 @@ def audit_log(viewer, params):
         if params.get(key):
             where.append(f"occurred_at {op} %s::date" + (" + 1" if key == "to" else ""))
             args.append(params[key])
+    clause = f"WHERE {' AND '.join(where)}" if where else ""
+    return clause, args
+
+
+def audit_log(viewer, params):
+    require_role(viewer, "admin")
+    clause, args = _audit_filters(params)
     try:
         limit = max(1, min(int(params.get("limit", 100)), 500))
         offset = max(0, int(params.get("offset", 0)))
     except ValueError:
         raise ApiError(400, "limit and offset must be numbers")
-    clause = f"WHERE {' AND '.join(where)}" if where else ""
     rows = query(
         f"SELECT * FROM audit_log {clause} ORDER BY occurred_at DESC, id DESC LIMIT %s OFFSET %s",
         args + [limit + 1, offset],
@@ -437,6 +445,28 @@ def audit_log(viewer, params):
         "has_more": len(rows) > limit,
         "actions": [a["action"] for a in actions],
     })
+
+
+EXPORT_CAP = 10000
+
+
+def audit_export(viewer, params):
+    """Every entry matching the filters, oldest first, for a CSV download.
+
+    Exporting the audit log is itself a sensitive action, so it is recorded in the log
+    along with the filters used and how many rows left the system.
+    """
+    require_role(viewer, "admin")
+    clause, args = _audit_filters(params)
+    rows = query(
+        f"SELECT * FROM audit_log {clause} ORDER BY occurred_at ASC, id ASC LIMIT %s",
+        args + [EXPORT_CAP + 1],
+    )
+    truncated = len(rows) > EXPORT_CAP
+    rows = rows[:EXPORT_CAP]
+    filters = {k: params[k] for k in ("q", "action", "entity_type", "entity_id", "actor_id", "from", "to") if params.get(k)}
+    audit(viewer, "audit.export", "audit_log", None, "Audit log (CSV export)", {"rows": len(rows), "filters": filters, "truncated": truncated})
+    return response(200, {"entries": rows, "truncated": truncated, "cap": EXPORT_CAP})
 
 
 # ---------- Router ----------
@@ -468,6 +498,8 @@ def handler(event=None, context=None):
                 return get_user(viewer, parts[0])
             if method in ("PATCH", "PUT"):
                 return update_user(viewer, parts[0], body)
+        elif len(parts) == 2 and parts[0] == "audit" and parts[1] == "export" and method == "GET":
+            return audit_export(viewer, params)
         elif len(parts) == 3 and parts[0] == "approvals" and method == "POST" and parts[2] in ("approve", "reject", "cancel"):
             return decide(viewer, parts[1], parts[2], body)
         elif len(parts) == 2 and method == "POST":

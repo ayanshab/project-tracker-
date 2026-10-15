@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { Link } from 'react-router-dom'
 import { api } from '../services/api'
-import { Button, Empty, ErrorNote, Loading, PageHeader, Panel, Tag, useApi } from '../components/ui'
+import { Button, Empty, ErrorNote, Loading, PageHeader, Panel, Tag, useApi, useToast } from '../components/ui'
 import { ROLE_LABEL } from '../utils/format'
 
 // Plain-language names and colors for every recorded action.
@@ -40,9 +40,15 @@ const ACTIONS = {
   'task.reopen': ['Unchecked task', 'warn'],
   'task.delete': ['Deleted task', 'warn'],
   'time.log': ['Logged time', 'muted'],
+  'time.edit': ['Edited time entry', 'info'],
   'time.delete': ['Deleted time entry', 'warn'],
   'cost.add': ['Added cost', 'info'],
   'cost.delete': ['Removed cost', 'warn'],
+  'approval.request': ['Requested approval', 'violet'],
+  'approval.approve': ['Approved change', 'good'],
+  'approval.reject': ['Rejected change', 'bad'],
+  'approval.cancel': ['Cancelled request', 'warn'],
+  'audit.export': ['Exported audit log', 'warn'],
 }
 
 const FIELD = {
@@ -72,14 +78,43 @@ function describe(e) {
   if (d.username && e.action === 'auth.login_failed') bits.push(`username "${d.username}"`)
   if (d.role && e.action === 'user.create') bits.push(ROLE_LABEL[d.role])
   if (d.reason) bits.push(d.reason)
+  if (d.note) bits.push(`note: ${d.note}`)
+  if (d.rows !== undefined) bits.push(`${d.rows} rows${d.truncated ? ' (cut at the cap)' : ''}`)
   return bits.join(', ')
 }
 
+// Flatten before/after changes into one readable cell: "pay rate: 40 to 45; manager: none to another person".
+const changesText = (e) => Object.entries(e.details?.changes || {}).map(([k, [a, b]]) => `${FIELD[k] || k}: ${show(a)} to ${show(b)}`).join('; ')
+
+// One row per entry, written so a person or an AI can read it without decoding anything:
+// a readable timestamp, a plain-English action, the before/after changes spelled out, and the raw
+// details JSON last for anything the summary leaves out.
+const CSV_COLUMNS = [
+  ['timestamp_utc', (e) => new Date(e.occurred_at).toISOString()],
+  ['date', (e) => e.occurred_at.slice(0, 10)],
+  ['actor', (e) => e.actor_name || 'Unknown'],
+  ['actor_role', (e) => ROLE_LABEL[e.actor_role] || e.actor_role || ''],
+  ['action', (e) => label(e.action)[0]],
+  ['action_code', (e) => e.action],
+  ['target_type', (e) => e.entity_type],
+  ['target', (e) => e.entity_name || ''],
+  ['summary', (e) => describe(e)],
+  ['changes', changesText],
+  ['reason', (e) => e.details?.reason || e.details?.note || ''],
+  ['source_ip', (e) => e.source_ip || ''],
+  ['target_id', (e) => e.entity_id || ''],
+  ['actor_id', (e) => e.actor_id || ''],
+  ['details_json', (e) => JSON.stringify(e.details || {})],
+]
+
 function toCsv(rows) {
-  const cols = ['occurred_at', 'actor_name', 'actor_role', 'action', 'entity_type', 'entity_name', 'entity_id', 'summary', 'source_ip', 'details']
-  const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`
-  const lines = rows.map((r) => cols.map((c) => esc(c === 'summary' ? describe(r) : c === 'details' ? JSON.stringify(r.details) : r[c])).join(','))
-  return [cols.join(','), ...lines].join('\n')
+  const esc = (v) => {
+    const s = String(v ?? '')
+    // Quote every cell, and neutralise cells starting with = + - @ so a spreadsheet never runs them as formulas.
+    return `"${(/^[=+\-@]/.test(s) ? `'${s}` : s).replace(/"/g, '""')}"`
+  }
+  const lines = rows.map((r) => CSV_COLUMNS.map(([, get]) => esc(get(r))).join(','))
+  return [CSV_COLUMNS.map(([name]) => name).join(','), ...lines].join('\r\n')
 }
 
 export default function AuditLog() {
@@ -88,6 +123,8 @@ export default function AuditLog() {
   const filterKey = JSON.stringify(filters)
   const [older, setOlder] = useState({ key: '', pages: [] })
   const [moreBusy, setMoreBusy] = useState(false)
+  const [exporting, setExporting] = useState(false)
+  const toast = useToast()
   const { data, error, loading, reload } = useApi(() => api.get('/users/audit', { ...filters, limit: 100 }), [filterKey])
 
   const pages = older.key === filterKey ? older.pages : []
@@ -104,13 +141,25 @@ export default function AuditLog() {
     }
   }
 
-  const exportCsv = () => {
-    const blob = new Blob([toCsv(entries)], { type: 'text/csv' })
-    const a = document.createElement('a')
-    a.href = URL.createObjectURL(blob)
-    a.download = `audit-log-${new Date().toISOString().slice(0, 10)}.csv`
-    a.click()
-    URL.revokeObjectURL(a.href)
+  // Exports everything that matches the current filters, not just the rows on screen.
+  const exportCsv = async () => {
+    setExporting(true)
+    try {
+      const d = await api.get('/users/audit/export', filters)
+      const blob = new Blob(['﻿', toCsv(d.entries)], { type: 'text/csv;charset=utf-8' })
+      const a = document.createElement('a')
+      a.href = URL.createObjectURL(blob)
+      const span = filters.from || filters.to ? `${filters.from || 'start'}_to_${filters.to || 'today'}` : new Date().toISOString().slice(0, 10)
+      a.download = `acme-tracker-audit-log-${span}.csv`
+      a.click()
+      URL.revokeObjectURL(a.href)
+      toast(d.truncated ? `Exported the first ${d.cap.toLocaleString('en-US')} entries. Narrow the dates to get the rest.` : `Exported ${d.entries.length.toLocaleString('en-US')} entries`, d.truncated ? 'warn' : undefined)
+      reload()
+    } catch (err) {
+      toast(err.message, 'bad')
+    } finally {
+      setExporting(false)
+    }
   }
 
   const set = (k) => (e) => setDraft((d) => ({ ...d, [k]: e.target.value }))
@@ -121,7 +170,7 @@ export default function AuditLog() {
       <PageHeader
         title="Audit log"
         subtitle="Every change in the tracker: who did it, when, and what changed. Entries cannot be edited or deleted. Only admins can see this page."
-        actions={<Button variant="ghost" onClick={exportCsv} disabled={!entries.length}>Export CSV</Button>}
+        actions={<Button variant="ghost" onClick={exportCsv} busy={exporting} disabled={!entries.length} title="Download every entry matching the filters as a CSV file you can open in Excel or hand to an AI assistant">Export CSV</Button>}
       />
       <form className="toolbar" role="search" onSubmit={(e) => { e.preventDefault(); setFilters(draft) }}>
         <input type="search" placeholder="Search person, project, or detail" value={draft.q} onChange={set('q')} aria-label="Search audit log" />
@@ -134,6 +183,8 @@ export default function AuditLog() {
           <option value="task.">Tasks</option>
           <option value="time.">Time entries</option>
           <option value="cost.">Costs</option>
+          <option value="approval.">Approvals</option>
+          <option value="audit.">Audit log exports</option>
           {(data?.actions || []).map((a) => <option key={a} value={a}>{label(a)[0]}</option>)}
         </select>
         <label className="check">From <input type="date" value={draft.from} onChange={set('from')} /></label>
